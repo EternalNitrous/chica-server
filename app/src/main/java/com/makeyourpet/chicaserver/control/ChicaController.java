@@ -108,6 +108,10 @@ public final class ChicaController {
     private volatile double lastPrimaryY = 0.0d;
     private volatile double lastSecondaryX = 0.0d;
     private volatile double lastSecondaryY = 0.0d;
+    // Tertiary holds the setzu (z,u) axes. The original's set-pose is a full
+    // 6-DOF p3.a(x,y,z,u,v,w): primary=(x,y), tertiary=(z,u), secondary=(v,w).
+    private volatile double lastTertiaryX = 0.0d;
+    private volatile double lastTertiaryY = 0.0d;
     private volatile double orientationX = 0.0d;
     private volatile double orientationY = 0.0d;
     private volatile double orientationZ = 0.0d;
@@ -407,7 +411,7 @@ public final class ChicaController {
         text.append(",\"stand\":").append(standing ? "true" : "false");
         text.append(",\"keep\":").append(keepMode ? "true" : "false");
         text.append(",\"walk\":").append(activeWalk ? "true" : "false");
-        text.append(",\"set\":").append((lastPrimaryX != 0.0d || lastPrimaryY != 0.0d || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d) ? "true" : "false");
+        text.append(",\"set\":").append((lastPrimaryX != 0.0d || lastPrimaryY != 0.0d || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d) ? "true" : "false");
         text.append(",\"crab\":").append(crabMode ? "true" : "false");
         text.append(",\"mode\":").append(modeIndex);
         text.append(",\"gaitMode\":").append(walkModeIndex < 0 ? 5 : walkModeIndex);
@@ -607,8 +611,11 @@ public final class ChicaController {
             lastPrimaryX = e[0];
             lastPrimaryY = e[1];
         } else if (command.startsWith("setzu:")) {
-            lastSecondaryX = clampStick(parts[1]);
-            lastSecondaryY = clampStick(parts[0]);
+            // z = second value, u = first value (original: z=v8, u=v3). z/u live
+            // in separate xyz/uvw vectors, so clamp each axis independently and
+            // store in the tertiary slot (NOT secondary, which is v,w).
+            lastTertiaryX = clampUnit(parts[1]);
+            lastTertiaryY = clampUnit(parts[0]);
         } else if (command.startsWith("setvw:")) {
             double[] f = clampStickPair(-parts[0], -parts[1]);
             lastSecondaryX = f[0];
@@ -646,13 +653,15 @@ public final class ChicaController {
 
     private void resetSetControls() {
         if (lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || setWorkerRunning) {
+                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d || setWorkerRunning) {
             setPoseDecayUntilMillis = System.currentTimeMillis() + 1500L;
         }
         lastPrimaryX = 0.0d;
         lastPrimaryY = 0.0d;
         lastSecondaryX = 0.0d;
         lastSecondaryY = 0.0d;
+        lastTertiaryX = 0.0d;
+        lastTertiaryY = 0.0d;
         // Let the post-release decay ramp the orbit pose back down via the static
         // integrator, then clearSetPose resets the sweep angle.
         setSweepMode = 0;
@@ -756,7 +765,7 @@ public final class ChicaController {
         if (!relayStatus || !standing) return false;
         long now = System.currentTimeMillis();
         boolean hasTarget = lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d;
+                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d;
         if (!hasTarget && now > setPoseDecayUntilMillis) {
             setPoseDecayUntilMillis = 0L;
             lastPulses = mergeActiveLegPulses(gaitEngine.clearSetPose());
@@ -777,8 +786,8 @@ public final class ChicaController {
             lastPulses = mergeActiveLegPulses(gaitEngine.stepSetPose(
                     lastPrimaryX,
                     lastPrimaryY,
-                    0.0d,
-                    0.0d,
+                    lastTertiaryX,
+                    lastTertiaryY,
                     lastSecondaryX,
                     lastSecondaryY,
                     dtMs));
@@ -830,8 +839,8 @@ public final class ChicaController {
                         lastPulses = mergeActiveLegPulses(gaitEngine.stepSetPose(
                                 lastPrimaryX * blend,
                                 lastPrimaryY * blend,
-                                0.0d,
-                                0.0d,
+                                lastTertiaryX * blend,
+                                lastTertiaryY * blend,
                                 lastSecondaryX * blend,
                                 lastSecondaryY * blend,
                                 ORIGINAL_QUAD_SET25_STEP_MS[i]));
@@ -922,7 +931,7 @@ public final class ChicaController {
     }
 
     private void publishOriginalHomePose(double threshold) {
-        if (activeWalk || lastPrimaryX != 0.0d || lastPrimaryY != 0.0d || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d) {
+        if (activeWalk || lastPrimaryX != 0.0d || lastPrimaryY != 0.0d || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d) {
             return;
         }
         ModeParams mode = currentMode();
@@ -955,7 +964,7 @@ public final class ChicaController {
         long started = System.currentTimeMillis();
         int nextMode = Math.max(0, Math.min(4, requestedMode));
         if (nextMode == modeIndex || activeWalk || lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d) {
+                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d) {
             return;
         }
         if (nextMode == 4) {
@@ -1235,7 +1244,7 @@ public final class ChicaController {
 
     private boolean ensureOriginalStandingForImpulse() {
         if (activeWalk || lastWalk.active() || lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d) {
+                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d) {
             return false;
         }
         blockMode = false;
@@ -1592,18 +1601,15 @@ public final class ChicaController {
         if (modeIndex == 4) {
             return 20;
         }
-        switch (walkModeIndex) {
-            case 5:
-                return 1;
-            case 9:
-                return 2;
-            case 6:
-                return 3;
-            case 7:
-                return 4;
-            default:
-                return clampGait(gait);
+        // Walk styles map directly to apk gait ids (walkModeIndex already IS the
+        // apk gait id): walk3=5 Tripod, walk2=6, walk1=7, walk15=8, walk25=9,
+        // walkwave=10. The old switch only handled 5/6/7/9 and dropped walk15(8)
+        // and walkwave(10) to the mode default, so those two styles silently
+        // walked the wrong gait. apkGaitFromJava passes 5-10 through.
+        if (walkModeIndex >= 5 && walkModeIndex <= 10) {
+            return walkModeIndex;
         }
+        return clampGait(gait);
     }
 
     private static int clampGait(int gait) {

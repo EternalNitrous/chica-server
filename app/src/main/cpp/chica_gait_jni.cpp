@@ -78,11 +78,14 @@ struct Engine {
 
 int apkGaitFromJava(int javaGait)
 {
+    if (javaGait == 20) return 20; // Quad gait (Quad phase table)
+    // Walk styles already pass the apk gait id directly (5-10): Tripod, Triple,
+    // Ripple, Ripple15, Triple25, Wave. Pass them through (matches iOS bridge).
+    if (javaGait >= 5 && javaGait <= 10) return javaGait;
     switch (javaGait) {
         case 2: return 9;  // Ripple 2.5 / RippleExt
         case 3: return 6;  // Ripple
         case 4: return 7;  // Amble / walk1
-        case 20: return 20; // Quad gait (Quad phase table)
         default: return 5; // Tripod
     }
 }
