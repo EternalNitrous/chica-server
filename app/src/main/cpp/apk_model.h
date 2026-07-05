@@ -33,6 +33,12 @@ struct RobotConfig {
     // Femur-derived scale on the body pose/motion limits, mirroring the
     // original z0.j.d(((FEMUR_LEN+80)/2)/80). 1.0 for the stock 80mm femur.
     double femur_scale = 1.0;
+    // Per-mode gait params (original z0.j statics set on every mode change):
+    // j.f7129h = swing lift (MODE_* 5th value: STANDARD 40, QUADRUPED 35),
+    // j.f7131j = walk animation factor (7th value: STANDARD 1.0, RACE 0.0).
+    // The walk animation layer blends at walk_anim_factor / 12 per frame.
+    double swing_lift = 40.0;
+    double walk_anim_factor = 1.0;
 };
 
 struct BodyState {
@@ -51,6 +57,11 @@ struct WalkState {
     double phase = 0.0;
     BodyState body;
     Pose animation_layer;
+    // Quad CoG layer (original layer[2], the second `if (i5 == 20)` block in
+    // p3.a.g(): during each stance gap the body leans toward the point where
+    // the line body->3-support-leg-centroid crosses the prev/next-foot
+    // diagonal, unloading the next swing leg so it can physically lift).
+    Pose cog_layer;
     std::array<Vec3, 6> anchors = {};
     std::array<bool, 6> anchor_active = {};
 };
@@ -68,6 +79,7 @@ struct WalkStepResult {
     Pose body_delta;
     Pose animation_target;
     Pose animation_layer;
+    Pose cog_layer;
     std::array<double, 6> swing_progress = {};
     std::array<std::array<double, 3>, 6> angles_deg = {};
     struct SwingTrace {
@@ -118,6 +130,10 @@ Vec3 neutralFootForBody(const RobotConfig& config,
                         const Pose& body_delta,
                         int leg);
 void initializeWalkState(const RobotConfig& config, WalkState& state);
+bool quadCogLeanDelta(const BodyState& state,
+                      const std::array<bool, 6>& active,
+                      int leg,
+                      Vec3& out);
 WalkStepResult walkStep(const RobotConfig& config,
                         WalkState& state,
                         WalkCommand command,

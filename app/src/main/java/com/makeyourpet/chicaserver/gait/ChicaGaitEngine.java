@@ -46,6 +46,18 @@ public final class ChicaGaitEngine implements AutoCloseable {
         nativeBeginWalkSession(nativeHandle);
     }
 
+    /**
+     * Re-seat every foot from the current per-leg servo angles via forward
+     * kinematics (original z0.a.a(null) -> z0.j.a() on leg re-enable). Parked
+     * legs stay frozen at their tuck angles while the body drifts during a
+     * walk, so their stored world position goes stale; FK snaps them back
+     * under the current body. Call before the quad-exit shape ramp.
+     */
+    public synchronized void reseatFeetFromForwardKinematics() {
+        ensureOpen();
+        nativeReseatFeetFromForwardKinematics(nativeHandle);
+    }
+
     public synchronized double beginWalkLayerFade() {
         ensureOpen();
         return nativeBeginWalkLayerFade(nativeHandle);
@@ -148,18 +160,29 @@ public final class ChicaGaitEngine implements AutoCloseable {
     public synchronized void configureMode(double radius,
                                            double cornerAngleDeg,
                                            double elongation,
-                                           double legSittingZ) {
+                                           double legSittingZ,
+                                           double swingLift,
+                                           double walkAnimFactor) {
         ensureOpen();
-        nativeConfigureMode(nativeHandle, radius, cornerAngleDeg, elongation, legSittingZ);
+        nativeConfigureMode(nativeHandle, radius, cornerAngleDeg, elongation, legSittingZ,
+                swingLift, walkAnimFactor);
     }
 
     public synchronized void configureModeForLegs(double radius,
                                                   double cornerAngleDeg,
                                                   double elongation,
                                                   double legSittingZ,
+                                                  double swingLift,
+                                                  double walkAnimFactor,
                                                   int[] activeLegs) {
         ensureOpen();
-        nativeConfigureModeForLegs(nativeHandle, radius, cornerAngleDeg, elongation, legSittingZ, activeLegs);
+        nativeConfigureModeForLegs(nativeHandle, radius, cornerAngleDeg, elongation, legSittingZ,
+                swingLift, walkAnimFactor, activeLegs);
+    }
+
+    public synchronized boolean beginCogLeanRamp(int leg, double durationMs) {
+        ensureOpen();
+        return nativeBeginCogLeanRamp(nativeHandle, leg, durationMs);
     }
 
     public synchronized void seedFromPulses(int[] pulses, double bodyZ) {
@@ -280,6 +303,7 @@ public final class ChicaGaitEngine implements AutoCloseable {
     private static native void nativeReset(long handle);
     private static native boolean nativeHasActiveWalkAnchors(long handle);
     private static native void nativeBeginWalkSession(long handle);
+    private static native void nativeReseatFeetFromForwardKinematics(long handle);
     private static native double nativeBeginWalkLayerFade(long handle);
     private static native int[] nativeStepWalkLayerFade(long handle, double amount);
     private static native int[] nativeFinishWalkLayerFade(long handle);
@@ -335,18 +359,23 @@ public final class ChicaGaitEngine implements AutoCloseable {
                                                               double cornerAngleDeg,
                                                               double elongation,
                                                               double durationMs);
+    private static native boolean nativeBeginCogLeanRamp(long handle, int leg, double durationMs);
     private static native int[] nativeSampleTimedAnimation(long handle,
                                                            double elapsedMs);
     private static native void nativeConfigureMode(long handle,
                                                    double radius,
                                                    double cornerAngleDeg,
                                                    double elongation,
-                                                   double legSittingZ);
+                                                   double legSittingZ,
+                                                   double swingLift,
+                                                   double walkAnimFactor);
     private static native void nativeConfigureModeForLegs(long handle,
                                                           double radius,
                                                           double cornerAngleDeg,
                                                           double elongation,
                                                           double legSittingZ,
+                                                          double swingLift,
+                                                          double walkAnimFactor,
                                                           int[] activeLegs);
     private static native void nativeSeedFromPulses(long handle, int[] pulses, double bodyZ);
     private static native int[] nativeStepSetPose(long handle,

@@ -144,7 +144,8 @@ void addPoseInPlace(Pose& target, const Pose& delta)
     target.uvw.z += delta.uvw.z;
 }
 
-Pose animationPose(const BodyState& state, double phase, int animation_id, double scale)
+Pose animationPose(const BodyState& state, double phase, int animation_id, double scale,
+                   const std::array<bool, 6>& active)
 {
     double angle = Pi * phase * 2.0;
     double x = 0.0;
@@ -187,13 +188,22 @@ Pose animationPose(const BodyState& state, double phase, int animation_id, doubl
             w = std::sin(angle) * 12.0;
             break;
         default: {
+            // anim0 body bob = half the foot-z spread. Only ENABLED legs count:
+            // in quad the 2 disabled legs are tucked ~65mm above the body, and
+            // including them blows the spread from ~35mm to ~150mm -> the body
+            // rides absurdly high during quad walk (and leaks a residual z into
+            // the walk layer that lingers in hex standing until the next gait
+            // re-blends it out). Ground truth (real apk quad) bobs only ~0..17mm,
+            // matching the active-leg spread. Original IKs/animates enabled legs
+            // only (z0.a.c()/f7054d).
             double min_z = 1.7976931348623157E308;
             double max_z = -1.7976931348623157E308;
             for (int leg : ApkLegOrder) {
+                if (!active[leg]) continue;
                 min_z = std::min(min_z, state.feet[leg].z);
                 max_z = std::max(max_z, state.feet[leg].z);
             }
-            z = (max_z - min_z) / 2.0;
+            if (min_z <= max_z) z = (max_z - min_z) / 2.0;
             break;
         }
     }
@@ -446,6 +456,66 @@ void initializeWalkState(const RobotConfig& config, WalkState& state)
     state.body.feet = config.neutral_feet;
 }
 
+// p3.a.v(): CoG support point for `leg` (about to swing) in a 4-active-leg
+// stance — intersection of the line (body -> centroid of the other 3 support
+// feet) with the prev/next-foot diagonal, pulled toward the centroid (<=30mm),
+// returned as a body-frame xy delta from the current body position.
+bool quadCogLeanDelta(const BodyState& state,
+                      const std::array<bool, 6>& active,
+                      int leg,
+                      Vec3& out)
+{
+    static constexpr std::array<int, 6> f7050k = {5, 2, 1, 0, 3, 4};
+    std::array<int, 4> b_order = {};
+    int b_count = 0;
+    for (int candidate : f7050k) {
+        if (active[candidate] && b_count < 4) b_order[b_count++] = candidate;
+    }
+    if (b_count != 4) return false;
+    Vec3 prev_foot{}, next_foot{};
+    bool found = false;
+    for (int i = 0; i < 4; ++i) {
+        if (b_order[i] == leg) {
+            prev_foot = state.feet[b_order[(i + 3) % 4]];
+            next_foot = state.feet[b_order[(i + 1) % 4]];
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+    double cx = 0.0, cy = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        if (b_order[i] == leg) continue;
+        cx += state.feet[b_order[i]].x;
+        cy += state.feet[b_order[i]].y;
+    }
+    cx /= 3.0; cy /= 3.0;
+    auto lineThrough = [](double x1, double y1, double x2, double y2) -> Vec3 {
+        // w8.a: coefficients (a, b, c) of ax + by + c = 0
+        double ddx = x2 - x1, ddy = y2 - y1, a, b;
+        if (std::abs(ddx) > std::abs(ddy)) { b = -ddy / ddx; a = 1.0; }
+        else                               { a = -ddx / ddy; b = 1.0; }
+        return {b, a, -((y1 * a) + (x1 * b))};
+    };
+    Vec3 l1 = lineThrough(state.body.xyz.x, state.body.xyz.y, cx, cy);
+    Vec3 l2 = lineThrough(prev_foot.x, prev_foot.y, next_foot.x, next_foot.y);
+    double det = (l1.x * l2.y) - (l2.x * l1.y);
+    // Degenerate (near-parallel body->centroid and prev/next foot lines): the
+    // intersection runs to infinity. Skip the lean this frame rather than emit
+    // Inf into the CoG layer (which then poisons IK and the walk-end fade).
+    if (std::abs(det) < 1e-6) return false;
+    Vec3 inter = {((l1.y * l2.z) - (l2.y * l1.z)) / det,
+                  ((l1.z * l2.x) - (l2.z * l1.x)) / det, 0.0};
+    double dist = std::sqrt((inter.x - cx) * (inter.x - cx) + (inter.y - cy) * (inter.y - cy));
+    double pull = dist > 1e-9 ? std::min(30.0 / dist, 1.0) : 1.0;
+    Vec3 point = {inter.x * (1.0 - pull) + cx * pull,
+                  inter.y * (1.0 - pull) + cy * pull, 0.0};
+    out = {point.x - state.body.xyz.x, point.y - state.body.xyz.y, 0.0};
+    rotateDegrees(out, -state.body.uvw.x, 0.0, 0.0);
+    if (!std::isfinite(out.x) || !std::isfinite(out.y)) return false;
+    return true;
+}
+
 WalkStepResult walkStep(const RobotConfig& config,
                         WalkState& state,
                         WalkCommand command,
@@ -484,6 +554,35 @@ WalkStepResult walkStep(const RobotConfig& config,
     for (int leg : ApkLegOrder) {
         result.swing_progress[leg] = swingProgress(
             state.phase, table[leg].start, table[leg].end, 0.03);
+    }
+
+    // Gait 20 (quad) remaps the swing schedule onto the active legs, taken in
+    // the robot's default activation order, so the 4 active legs always amble
+    // in an evenly-spaced sequence regardless of which 2 legs are disabled.
+    // Mirrors the original p3.a.g() i5==20 block: dArr5[b()[i]] = dArr4[{0,3,5,2}[i]],
+    // disabled legs (f7056f) get -1. Without this the static Quad table is
+    // applied by leg index, shuffling the phases (e.g. for default quad legs
+    // 0<->5 and 2<->3 swap), wrecking the support sequence -> anchor drift ->
+    // high-steps in place (femur too big, coxa too small).
+    // Remapped swing WINDOWS per active leg (start/end), needed by the quad
+    // CoG-lean block below to locate the inter-swing gaps. Filled for gait 20.
+    std::array<PhaseWindow, 6> quad_win;
+    quad_win.fill({-1.0, -1.0});
+    if (gait_id == 20) {
+        static constexpr std::array<int, 6> default_active_order = {5, 2, 1, 0, 3, 4};
+        static constexpr std::array<int, 4> quad_phase_src = {0, 3, 5, 2};
+        std::array<double, 6> remapped;
+        remapped.fill(-1.0);  // disabled legs never swing
+        std::size_t active_index = 0;
+        for (int leg : default_active_order) {
+            if (!active[leg]) continue;
+            if (active_index < quad_phase_src.size()) {
+                remapped[leg] = result.swing_progress[quad_phase_src[active_index]];
+                quad_win[leg] = table[quad_phase_src[active_index]];
+            }
+            ++active_index;
+        }
+        result.swing_progress = remapped;
     }
 
     if (!allow_new_anchors) {
@@ -540,11 +639,11 @@ WalkStepResult walkStep(const RobotConfig& config,
         }
 
         Vec3 target = neutralFootForBody(config, state.body, lookahead_delta, leg);
-        Vec3 lifted = swingTrajectory(state.anchors[leg], target, progress, 40.0);
+        Vec3 lifted = swingTrajectory(state.anchors[leg], target, progress, config.swing_lift);
         result.swings[leg].used = true;
         result.swings[leg].leg = leg;
         result.swings[leg].progress = progress;
-        result.swings[leg].lift = 40.0;
+        result.swings[leg].lift = config.swing_lift;
         result.swings[leg].from = state.anchors[leg];
         result.swings[leg].to = target;
         result.swings[leg].result = lifted;
@@ -571,12 +670,63 @@ WalkStepResult walkStep(const RobotConfig& config,
         result.swings[leg].committed = state.body.feet[leg];
     }
 
-    Pose animation_target = animationPose(animation_source, state.phase, animation_id, config.femur_scale);
+    Pose animation_target = animationPose(animation_source, state.phase, animation_id, config.femur_scale, active);
     result.animation_target = animation_target;
-    blendPose(state.animation_layer, animation_target, 1.0 / 12.0);
+    blendPose(state.animation_layer, animation_target, config.walk_anim_factor / 12.0);
     result.animation_layer = state.animation_layer;
 
-    result.ik_ok = inverseKinematics(config, state.body, state.animation_layer, active, result.angles_deg);
+    // Quad CoG-lean layer (original p3.a.g() second `if (i5 == 20)` block +
+    // p3.a.v()). Reconstructed 2026-07-04 against GROUND TRUTH captured from the
+    // running apk (reverse/gt_capture_full.log, 1998 frames): the earlier
+    // decompile-only transliteration produced ±200mm body sloshing; the real
+    // lean is a gentle ±25-30mm hold. The discipline that keeps it bounded: the
+    // lean target is only advanced DURING the inter-swing gaps (when no leg is
+    // lifted) and HELD constant while a leg swings. During a gap the body eases
+    // toward supporting the leg about to lift (quadCogLeanDelta of that leg),
+    // with per-frame rate r5.g(dt / ((1-eased)·0.12·cycle·1000)).
+    if (gait_id == 20) {
+        auto swingLegAt = [&](double ph) -> int {
+            for (int leg : ApkLegOrder) {
+                if (quad_win[leg].start < 0.0) continue;
+                if (swingProgress(ph, quad_win[leg].start, quad_win[leg].end, 0.03) >= 0.0)
+                    return leg;
+            }
+            return -1;
+        };
+        int cur_swing = swingLegAt(state.phase);
+        if (cur_swing < 0) {  // inter-swing gap: advance the lean toward next lift
+            int next_leg = swingLegAt(wrapPhase(state.phase + 0.12));
+            int prev_leg = swingLegAt(wrapPhase(state.phase - 0.12));
+            if (next_leg >= 0 && prev_leg >= 0) {
+                double gap = swingProgress(state.phase, quad_win[prev_leg].end,
+                                           quad_win[next_leg].start, -0.03);
+                Vec3 target{};
+                if (gap >= 0.0 && quadCogLeanDelta(state.body, active, next_leg, target)) {
+                    double eased = std::sin(gap * M_PI / 2.0);
+                    double denom = (1.0 - eased) * (0.12 * cycle) * 1000.0;
+                    double rate = denom > 1e-9
+                        ? std::sin(std::min(dt_ms_scaled / denom, 1.0) * M_PI / 2.0) : 1.0;
+                    state.cog_layer.xyz.x += rate * (target.x - state.cog_layer.xyz.x);
+                    state.cog_layer.xyz.y += rate * (target.y - state.cog_layer.xyz.y);
+                }
+            }
+        }
+    } else if (state.cog_layer.xyz.x != 0.0 || state.cog_layer.xyz.y != 0.0) {
+        // fade any residual lean when not in quad, so re-entry starts clean
+        state.cog_layer.xyz.x *= 0.9;
+        state.cog_layer.xyz.y *= 0.9;
+        if (std::abs(state.cog_layer.xyz.x) < 0.05) state.cog_layer.xyz.x = 0.0;
+        if (std::abs(state.cog_layer.xyz.y) < 0.05) state.cog_layer.xyz.y = 0.0;
+    }
+    result.cog_layer = state.cog_layer;
+
+    // IK uses the body-base layer = animation + CoG lean summed (original sums
+    // both into layer[2] before solving).
+    Pose walk_layer = state.animation_layer;
+    walk_layer.xyz.x += state.cog_layer.xyz.x;
+    walk_layer.xyz.y += state.cog_layer.xyz.y;
+    walk_layer.xyz.z += state.cog_layer.xyz.z;
+    result.ik_ok = inverseKinematics(config, state.body, walk_layer, active, result.angles_deg);
     result.phase = state.phase;
     return result;
 }

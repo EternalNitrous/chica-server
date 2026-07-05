@@ -22,6 +22,7 @@ enum class TimedAnimationKind {
     PoseRamp,
     BodyRamp,
     ShapeRamp,
+    CogLean,
 };
 
 struct TimedAnimation {
@@ -29,6 +30,8 @@ struct TimedAnimation {
     apk_model::BodyState start;
     apk_model::BodyState target;
     std::vector<int> movingLegs;
+    apk_model::Pose cogStart;
+    apk_model::Pose cogTarget;
     double lift = 0.0;
     double layerBlend = 0.0;
     double durationMs = 1.0;
@@ -45,8 +48,21 @@ struct Engine {
     double sweepDR = 0.0;
     double sweepDS = 0.0;
     std::array<int, 18> lastPulses = {};
+    // Persistent last-committed joint angles per leg. Active legs are refreshed
+    // every IK flush / walk step; PARKED (disabled) legs keep their frozen tuck
+    // angles because inverseKinematics skips inactive legs. Forward-kinematics
+    // off this array re-seats the feet on leg re-enable (original
+    // z0.a.a(null) -> z0.j.a()), fixing the parked legs' stale stored world
+    // position after the body has drifted during a walk.
+    std::array<std::array<double, 3>, 6> lastAngles = {};
     int lastJavaGait = 1;
     int lastApkGait = 5;
+    // Which legs are active (used). Hexapod = all 6; quad = the 4 enabled legs.
+    // walkStep needs this so body IK only solves the active legs (parked legs
+    // are tucked at disabled-Z and unreachable, which otherwise makes every
+    // body-translation IK fail -> no travel) and so the gait-20 remap targets
+    // the correct legs. Mirrors the original z0.a.c()/f7054d enabled mask.
+    std::array<bool, 6> activeLegs = {true, true, true, true, true, true};
     int lastAnimation = 0;
     double lastDtMs = 0.0;
     bool lastAllowNewAnchors = true;
@@ -56,6 +72,7 @@ struct Engine {
     Engine()
     {
         apk_model::initializeWalkState(config, state);
+        for (auto& a : lastAngles) a = {0.0, 90.0, 120.0};
     }
 };
 
@@ -65,6 +82,7 @@ int apkGaitFromJava(int javaGait)
         case 2: return 9;  // Ripple 2.5 / RippleExt
         case 3: return 6;  // Ripple
         case 4: return 7;  // Amble / walk1
+        case 20: return 20; // Quad gait (Quad phase table)
         default: return 5; // Tripod
     }
 }
@@ -97,12 +115,19 @@ std::array<int, 18> toPulses(const std::array<std::array<double, 3>, 6>& angles)
 
 std::array<int, 18> toPulsesFromPose(Engine& engine)
 {
-    std::array<std::array<double, 3>, 6> angles = {};
-    std::array<bool, 6> active = {true, true, true, true, true, true};
+    // Seed from the persisted angles so PARKED legs (skipped by IK below) keep
+    // their frozen tuck angles; the IK refreshes only the active legs.
+    std::array<std::array<double, 3>, 6> angles = engine.lastAngles;
+    // Active-leg mask, not all-true: quad's parked legs are tucked/unreachable;
+    // an all-true IK fails and freezes on stale pulses (original IKs only the
+    // enabled legs, z0.a.c()/f7054d).
+    std::array<bool, 6> active = engine.activeLegs;
     apk_model::Pose combined = {};
     for (const auto& layer : engine.layers) {
         combined = apk_model::addPose(combined, layer);
     }
+    // Include the quad CoG layer (original layer[2]) like j.e sums all layers.
+    combined = apk_model::addPose(combined, engine.state.cog_layer);
     engine.state.animation_layer = combined;
     if (!apk_model::inverseKinematics(engine.config,
                                       engine.state.body,
@@ -111,6 +136,7 @@ std::array<int, 18> toPulsesFromPose(Engine& engine)
                                       angles)) {
         return engine.lastPulses;
     }
+    engine.lastAngles = angles;  // persist (active refreshed, parked preserved)
     engine.lastPulses = toPulses(angles);
     return engine.lastPulses;
 }
@@ -333,13 +359,17 @@ apk_model::Pose originalAnimationPose(const Engine& engine, double phase, int an
             pose.uvw.z = std::sin(angle) * 12.0;
             break;
         default: {
+            // anim0 body bob = half the ENABLED-leg foot-z spread. Excluding
+            // disabled legs is essential in quad: they tuck ~65mm above the body
+            // and would otherwise inflate the spread ~4x (body rides very high).
             double minZ = 1.7976931348623157E308;
             double maxZ = -1.7976931348623157E308;
             for (int leg : apk_model::ApkLegOrder) {
+                if (!engine.activeLegs[leg]) continue;
                 minZ = std::min(minZ, engine.state.body.feet[leg].z);
                 maxZ = std::max(maxZ, engine.state.body.feet[leg].z);
             }
-            pose.xyz.z = (maxZ - minZ) / 2.0;
+            if (minZ <= maxZ) pose.xyz.z = (maxZ - minZ) / 2.0;
             break;
         }
     }
@@ -419,9 +449,19 @@ bool beginShapeRamp(Engine& engine,
     const std::vector<int> allLegs(apk_model::ApkLegOrder.begin(), apk_model::ApkLegOrder.end());
     const std::vector<int>& legs = requested.empty() ? allLegs : requested;
     auto feet = neutralFeet(radius, z, cornerAngleDeg, elongation, allLegs);
+    // Transform the body-relative neutral into the world frame of the CURRENT
+    // body pose (same as neutralFootForBody, which the pose-ramp/home-pose use).
+    // Without this the shape-ramp targets origin-relative spots, so after the
+    // body has drifted from the origin (e.g. walking before a mode change) the
+    // legs get dragged by the body offset and the transition is malformed.
+    const apk_model::Pose& body = timed.start.body;
     for (int leg : legs) {
         if (leg < 0 || leg >= 6) continue;
-        timed.target.feet[leg] = feet[leg];
+        apk_model::Vec3 foot = feet[leg];
+        apk_model::rotateDegrees(foot, body.uvw.x, 0.0, 0.0);
+        foot.x += body.xyz.x;
+        foot.y += body.xyz.y;
+        timed.target.feet[leg] = foot;
     }
     timed.durationMs = std::max(1.0, durationMs);
     engine.timed = timed;
@@ -437,6 +477,19 @@ std::array<int, 18> sampleTimedAnimation(Engine& engine, double elapsedMs)
     double elapsed = std::max(0.0, elapsedMs);
     double t = std::min(1.0, elapsed / engine.timed.durationMs);
     apk_model::BodyState next = engine.timed.start;
+
+    if (engine.timed.kind == TimedAnimationKind::CogLean) {
+        // p3.a.M single-leg quad branch: layer2 = lerp(start, target, r5.g(t))
+        // flushed every frame; the swing ramp follows as a separate phase.
+        double eased = std::sin(t * M_PI / 2.0);
+        engine.state.cog_layer = lerpPose(engine.timed.cogStart, engine.timed.cogTarget, eased);
+        std::array<int, 18> pulses = toPulsesFromPose(engine);
+        if (t >= 1.0) {
+            engine.state.cog_layer = engine.timed.cogTarget;
+            engine.timed = {};
+        }
+        return pulses;
+    }
 
     if (engine.timed.kind == TimedAnimationKind::PoseRamp) {
         for (int leg : engine.timed.movingLegs) {
@@ -538,6 +591,9 @@ double beginWalkLayerFade(Engine& engine)
     for (const auto& layer : engine.layers) {
         combined = apk_model::addPose(combined, layer);
     }
+    // p3.a.p() folds ALL layers (incl. the quad CoG layer) into the fade.
+    combined = apk_model::addPose(combined, engine.state.cog_layer);
+    engine.state.cog_layer = {};
     engine.layers = {};
     engine.layers[0] = combined;
     engine.state.animation_layer = combined;
@@ -821,6 +877,23 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeBeginWalkSession(
     engine->state.anchor_active = {};
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeReseatFeetFromForwardKinematics(
+        JNIEnv*, jclass, jlong handle)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) {
+        return;
+    }
+    // Original z0.a.a(null) -> z0.j.a(): on leg re-enable, recompute EVERY foot
+    // from the current servo angles. Active legs round-trip to their existing
+    // position; PARKED legs (whose angles were frozen at the tuck while the
+    // body drifted through a walk) snap to their real body-framed location, so
+    // a following shape-ramp starts from where the legs physically are.
+    apk_model::forwardKinematics(engine->config, engine->lastAngles,
+                                 engine->state.animation_layer, engine->state.body);
+}
+
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeBeginWalkLayerFade(
         JNIEnv*, jclass, jlong handle)
@@ -877,6 +950,7 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeEnterConstructorPose
     engine->state.anchors = {};
     engine->state.anchor_active = {};
     apk_model::forwardKinematics(engine->config, angles, engine->state.animation_layer, engine->state.body);
+    engine->lastAngles = angles;
     engine->lastPulses = toPulses(angles);
     return toPulseArray(env, engine->lastPulses);
 }
@@ -1153,6 +1227,32 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeBeginShapeRampForLeg
                           jintArrayToLegs(env, rawLegs)) ? JNI_TRUE : JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeBeginCogLeanRamp(
+        JNIEnv*,
+        jclass,
+        jlong handle,
+        jint leg,
+        jdouble durationMs)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) {
+        return JNI_FALSE;
+    }
+    apk_model::Vec3 delta{};
+    if (!apk_model::quadCogLeanDelta(engine->state.body, engine->activeLegs, leg, delta)) {
+        return JNI_FALSE;
+    }
+    engine->timed = {};
+    engine->timed.kind = TimedAnimationKind::CogLean;
+    engine->timed.cogStart = engine->state.cog_layer;
+    engine->timed.cogTarget = engine->state.cog_layer;
+    engine->timed.cogTarget.xyz.x = delta.x;
+    engine->timed.cogTarget.xyz.y = delta.y;
+    engine->timed.durationMs = std::max(1.0, static_cast<double>(durationMs));
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeSampleTimedAnimation(
         JNIEnv* env,
@@ -1175,7 +1275,9 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeConfigureMode(
         jdouble radius,
         jdouble cornerAngleDeg,
         jdouble elongation,
-        jdouble legSittingZ)
+        jdouble legSittingZ,
+        jdouble swingLift,
+        jdouble walkAnimFactor)
 {
     auto* engine = fromHandle(handle);
     if (engine == nullptr) {
@@ -1185,7 +1287,11 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeConfigureMode(
     engine->config.corner_leg_angle_deg = cornerAngleDeg;
     engine->config.elongation = elongation;
     engine->config.leg_sitting_z = legSittingZ;
+    // Per-mode gait params (original j.f7129h / j.f7131j set on mode change).
+    engine->config.swing_lift = swingLift;
+    engine->config.walk_anim_factor = walkAnimFactor;
     engine->config.neutral_feet = neutralFeet(radius, legSittingZ, cornerAngleDeg, elongation);
+    engine->activeLegs = {true, true, true, true, true, true};
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1197,6 +1303,8 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeConfigureModeForLegs
         jdouble cornerAngleDeg,
         jdouble elongation,
         jdouble legSittingZ,
+        jdouble swingLift,
+        jdouble walkAnimFactor,
         jintArray rawActiveLegs)
 {
     auto* engine = fromHandle(handle);
@@ -1211,7 +1319,13 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeConfigureModeForLegs
     engine->config.corner_leg_angle_deg = cornerAngleDeg;
     engine->config.elongation = elongation;
     engine->config.leg_sitting_z = legSittingZ;
+    engine->config.swing_lift = swingLift;
+    engine->config.walk_anim_factor = walkAnimFactor;
     engine->config.neutral_feet = neutralFeet(radius, legSittingZ, cornerAngleDeg, elongation, active);
+    engine->activeLegs = {false, false, false, false, false, false};
+    for (int leg : active) {
+        if (leg >= 0 && leg < 6) engine->activeLegs[leg] = true;
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -1271,7 +1385,7 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeStep(
     command.forward = forward;
     command.left = strafe;
     command.turn = turn;
-    std::array<bool, 6> active = {true, true, true, true, true, true};
+    std::array<bool, 6> active = engine->activeLegs;
     int apkGait = apkGaitFromJava(javaGait);
     engine->state.animation_layer = engine->layers[0];
     auto step = apk_model::walkStep(engine->config,
@@ -1289,6 +1403,11 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeStep(
     engine->lastAllowNewAnchors = allowNewAnchors == JNI_TRUE;
     engine->lastStep = step;
     engine->layers[0] = engine->state.animation_layer;
+    // Persist only the ACTIVE legs' angles: walkStep's IK skips parked legs, so
+    // step.angles_deg holds stale zeros for them — keep their frozen tuck angles.
+    for (int leg : apk_model::ApkLegOrder) {
+        if (active[leg]) engine->lastAngles[leg] = step.angles_deg[leg];
+    }
     engine->lastPulses = toPulses(step);
     return toPulseArray(env, engine->lastPulses);
 }

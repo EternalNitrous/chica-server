@@ -963,14 +963,75 @@ public final class ChicaController {
             return;
         }
         ModeParams mode = ORIGINAL_MODES[nextMode];
+        int oldModeIndex = modeIndex;
+        boolean wasStanding = standing;
+
+        // QUAD EXIT (original z0.o.i() i8==4 path). The original SITS, then
+        // shape-ramps the previously-disabled legs OUT to the new mode geometry
+        // at sitting z (h.f7099h = -40) over 700/quad-speed, re-enables all legs,
+        // home-poses, and re-stands. The shape-ramp is a LINEAR lerp (no swing
+        // arc), so the tucked legs (z = femurScale*120 + connZ = 110) descend
+        // smoothly to neutral. Without it, the home pose's lift arc sweeps those
+        // legs UP past z=150 then down -> the "not smooth" quad->hex snap. Only
+        // quad->* needs this; hex->hex re-seats via the plain home pose below.
+        if (oldModeIndex == 4) {
+            if (wasStanding) {
+                enterOriginalSitPose();
+                standing = false;
+            }
+            relayStatus = true;
+            servoBackend.setRelay(true);
+            // Re-enable ALL legs BEFORE the shape-ramp (original z0.o.i does
+            // a(null) before C()). TWO masks must open, or the disabled legs
+            // misbehave through the ramp: (1) engine IK mask via configureMode —
+            // otherwise inverseKinematics skips legs {1,4} (leaving stale angles)
+            // and they collapse fully tucked under the body once visible; and
+            // (2) the output mask activeOutputLegs — otherwise mergeActiveLegPulses
+            // freezes {1,4} at their tuck pulses through the ramp (invisible
+            // "wait") and the later ALL_LEGS flip snaps them to hex. With both
+            // open, the ramp's descent is IK-solved and actually sent → smooth.
+            gaitEngine.configureMode(mode.radius, mode.cornerAngle, mode.elongation,
+                    ORIGINAL_LEG_SITTING_Z, mode.stepLift, mode.animationFactor);
+            activeOutputLegs = ALL_LEGS;
+            // Re-seat every foot from the current servo angles (forward
+            // kinematics) before ramping. The parked disabled legs stayed frozen
+            // at their tuck angles while the body drifted forward during the
+            // walk, so their stored world position is stale (~travelled distance
+            // behind the body). FK snaps them back under the CURRENT body;
+            // without it the shape-ramp starts from that stale spot and sweeps
+            // the whole distance -> malformed away from the origin. Mirrors the
+            // original z0.a.a(null) -> z0.j.a() on re-enable.
+            gaitEngine.reseatFeetFromForwardKinematics();
+            // The disabled legs are the two NOT in the quad active set. (Do NOT
+            // reuse activeLegComplement here: that maps disabled->active, so
+            // feeding it the active set returns a bogus 4-leg mix that ramps two
+            // active legs and misses two, splitting the active reconfiguration
+            // across both phases — the observed disabled-leg snap + off sequence.)
+            boolean[] isActive = new boolean[6];
+            for (int leg : quadrupedActiveLegs) {
+                if (leg >= 0 && leg < 6) isActive[leg] = true;
+            }
+            int[] disabledLegs = new int[6 - quadrupedActiveLegs.length];
+            for (int leg = 0, di = 0; leg < 6 && di < disabledLegs.length; leg++) {
+                if (!isActive[leg]) disabledLegs[di++] = leg;
+            }
+            publishTimedShapeRampForLegs(disabledLegs, mode.radius, ORIGINAL_LEG_SITTING_Z,
+                    mode.cornerAngle, mode.elongation, 700.0d / ORIGINAL_MODES[4].speed);
+        }
+
         modeIndex = nextMode;
         activeOutputLegs = ALL_LEGS;
         if (modeIndex <= 3) gait = modeIndex + 1;
-        gaitEngine.configureMode(mode.radius, mode.cornerAngle, mode.elongation, ORIGINAL_LEG_SITTING_Z);
+        gaitEngine.configureMode(mode.radius, mode.cornerAngle, mode.elongation, ORIGINAL_LEG_SITTING_Z,
+                mode.stepLift, mode.animationFactor);
         if (standing) {
             publishTimedBodyZRamp(mode.bodyLift, 400.0d / mode.speed);
         }
         enterOriginalHomePose();
+        if (oldModeIndex == 4 && wasStanding) {
+            enterOriginalStandPose();
+            standing = true;
+        }
         sleepRemaining(started, originalModeBusyMillis(nextMode));
     }
 
@@ -989,9 +1050,11 @@ public final class ChicaController {
         servoBackend.setRelay(true);
 
         int[] normalizedDisabled = normalizeDisabledQuadLegs(disabledLegs);
+        // Original tucks the disabled legs at STANDARD radius+40 (h.f7104n[0]),
+        // not the outgoing mode's radius; duration uses the outgoing speed.
         publishTimedShapeRampForLegs(
                 normalizedDisabled,
-                oldMode.radius + 40.0d,
+                ORIGINAL_MODES[0].radius + 40.0d,
                 ORIGINAL_QUAD_DISABLED_Z,
                 80.0d,
                 1.0d,
@@ -1006,6 +1069,8 @@ public final class ChicaController {
                 quadMode.cornerAngle,
                 quadMode.elongation,
                 ORIGINAL_LEG_SITTING_Z,
+                quadMode.stepLift,
+                quadMode.animationFactor,
                 quadrupedActiveLegs);
         if (oldModeIndex <= 3) gait = oldModeIndex + 1;
 
@@ -1471,7 +1536,7 @@ public final class ChicaController {
     private void publishOriginalWalkLayerFade() {
         double magnitude = gaitEngine.beginWalkLayerFade();
         long previous = System.currentTimeMillis();
-        while (magnitude > 0.05000000074505806d) {
+        while (Double.isFinite(magnitude) && magnitude > 0.05000000074505806d) {
             long now = System.currentTimeMillis();
             double amount = currentMode().speed * 0.1d * (double) (now - previous);
             if (amount >= magnitude) break;
@@ -1521,6 +1586,12 @@ public final class ChicaController {
     }
 
     private int gaitForMode() {
+        // Quad uses the dedicated Quad gait (apk id 20): legs 0,2,3,5 swing in a
+        // quad amble, legs 1,4 never swing. Without this, quad falls back to the
+        // walk-style gait (Tripod) which flails 4 legs in a 6-leg pattern.
+        if (modeIndex == 4) {
+            return 20;
+        }
         switch (walkModeIndex) {
             case 5:
                 return 1;
