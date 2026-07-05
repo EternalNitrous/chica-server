@@ -68,6 +68,12 @@ public final class ChicaController {
     private volatile int walkModeIndex = -1;
     private volatile boolean cameraEnabled = false;
     private volatile String pendingCommand = "";
+    // Original z0.f.f7069e: pending beep count consumed by the beeper worker.
+    private volatile int beepCount = 0;
+    private android.media.ToneGenerator toneGenerator;
+    // Latch so the warning-cutoff "torque" command is submitted once per
+    // over-limit episode (original gates via f7078o command-in-flight).
+    private volatile boolean cutoffTorquePending = false;
     private volatile String hardwareStatus = "virtual";
     private volatile String ipAddress = "0.0.0.0";
     private volatile boolean busy = false;
@@ -148,6 +154,53 @@ public final class ChicaController {
                 robot.legConnectionZ, robot.legSittingZ);
         enterOriginalStartupPose();
         startOriginalHardwareMonitor();
+        startOriginalBeeperWorker();
+        // z0.f.b(): board install beeps once on a successful open, six times on
+        // failure.
+        beepCount = servoBackend.isConnected() ? 1 : 6;
+    }
+
+    // Original z0.c TimerTask (100 ms): play beepCount tones at 200 ms spacing,
+    // zero the counter, then hold 1 s so repeated warning re-arms read as a
+    // beep PATTERN (N beeps / second) rather than a continuous tone.
+    private void startOriginalBeeperWorker() {
+        Thread thread = new Thread(() -> {
+            while (true) {
+                try {
+                    int count = beepCount;
+                    while (count > 0) {
+                        playOriginalBeepTone();
+                        Thread.sleep(200L);
+                        count--;
+                        if (count == 0) {
+                            beepCount = 0;
+                            Thread.sleep(1000L);
+                        }
+                    }
+                    Thread.sleep(100L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Exception ignored) {
+                }
+            }
+        }, "chica-original-beeper");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    // Original e4.f.a(): ToneGenerator(STREAM_MUSIC, 100).startTone(44, 200) on
+    // the phone. Falls back to the backend hook (test fixtures) if audio is
+    // unavailable (e.g. host-side unit tests).
+    private void playOriginalBeepTone() {
+        try {
+            if (toneGenerator == null) {
+                toneGenerator = new android.media.ToneGenerator(3, 100);
+            }
+            toneGenerator.startTone(44, 200);
+        } catch (Throwable ignored) {
+        }
+        servoBackend.beep();
     }
 
     // Original z0.e heartbeat: wake at 1 ms resolution, but perform hardware work
@@ -552,7 +605,7 @@ public final class ChicaController {
         } else if (command.startsWith("set")) {
             applySetCommand(command);
         } else if (command.startsWith("beep")) {
-            servoBackend.beep();
+            playOriginalBeepTone();  // original dispatch: i.a() direct tone
         }
     }
 
@@ -913,10 +966,18 @@ public final class ChicaController {
     }
 
     private void enterOriginalStartupPose() {
+        // Original boot = o() ctor -> i([], 0): old mode is the sentinel 9, so it
+        // runs the block-mode EXIT with force (a(false, true)) — raise to the
+        // block row + (80, 100) then settle to MODE_STANDARD at sitting z. Derive
+        // from the parsed mode table so custom configs boot exactly.
         lastPulses = gaitEngine.enterConstructorPose();
         publishOriginalFrame();
-        publishTimedShapeRamp(265.0d, 60.0d, 30.0d, 1.07d, 800.0d);
-        publishTimedShapeRamp(220.0d, -40.0d, 55.0d, 1.15d, 1200.0d);
+        ModeParams block = ORIGINAL_MODES[5];
+        ModeParams standard = ORIGINAL_MODES[0];
+        publishTimedShapeRamp(block.radius + 80.0d, block.bodyLift + 100.0d,
+                block.cornerAngle, block.elongation, 800.0d / standard.speed);
+        publishTimedShapeRamp(standard.radius, ORIGINAL_LEG_SITTING_Z,
+                standard.cornerAngle, standard.elongation, 1200.0d / standard.speed);
     }
 
     private void handleAckRampLocked(int ackCount) {
@@ -1147,11 +1208,13 @@ public final class ChicaController {
 
     private void publishOriginalBlockRaisedRamp() {
         ModeParams block = ORIGINAL_MODES[5];
+        // Durations divide by j.f7130i = the CURRENT mode's speed (block is not
+        // a mode; f7161n/f7130i stay on the active mode), not the block row's.
         publishTimedShapeRamp(block.radius + 80.0d,
                 block.bodyLift + 100.0d,
                 block.cornerAngle,
                 block.elongation,
-                800.0d / block.speed);
+                800.0d / currentMode().speed);
     }
 
     private void publishOriginalBlockShapeRamp() {
@@ -1161,7 +1224,7 @@ public final class ChicaController {
                 block.bodyLift,
                 block.cornerAngle,
                 block.elongation,
-                1200.0d / block.speed);
+                1200.0d / currentMode().speed);
     }
 
     private void publishOriginalSittingShapeRampForMode(ModeParams mode) {
@@ -1735,6 +1798,7 @@ public final class ChicaController {
             resetOriginalWarningTimers(now);
             voltageWarning = false;
             currentWarning = false;
+            cutoffTorquePending = false;
             return;
         }
         if (lastCurrent < currentWarningLevel) currentWarningSinceMillis = now;
@@ -1747,13 +1811,22 @@ public final class ChicaController {
         boolean currentCutoff = elapsedPast(now, currentCutoffSinceMillis, currentWarningDuration);
         boolean voltageCutoff = elapsedPast(now, voltageCutoffSinceMillis, voltageWarningDuration);
         if (currentCutoff || voltageCutoff) {
-            relayStatus = false;
-            servoBackend.setRelay(false);
-            pendingCommand = "torque";
-            lastCommandMillis = now;
-        } else if ((voltageBeepCount > 0 && voltageWarning)
-                || (currentBeepCount > 0 && currentWarning)) {
-            servoBackend.beep();
+            // Original z0.d: f7069e = 6 (six beeps) and ENQUEUE the "torque"
+            // command (f7079p -> executor), which runs the full toggle path —
+            // sit first if standing, THEN relay off — a graceful shutdown, not a
+            // hard relay cut. One command in flight at a time (f7078o gate);
+            // retried every tick until the relay actually drops (e.g. if the
+            // toggle bailed on originalMotionBusy), matching the original's
+            // continuous re-enqueue. Relay-off resets the latch above.
+            if (!cutoffTorquePending || !busy) {
+                cutoffTorquePending = true;
+                beepCount = 6;
+                submitOriginalCommand("torque");
+            }
+        } else if (voltageBeepCount > 0 && voltageWarning) {
+            beepCount = voltageBeepCount;  // original: f7069e = h.D
+        } else if (currentBeepCount > 0 && currentWarning) {
+            beepCount = currentBeepCount;  // original: f7069e = h.f7113w
         }
     }
 
