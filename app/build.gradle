@@ -4,7 +4,10 @@ plugins {
 
 android {
     namespace "com.makeyourpet.chicaserver"
-    compileSdk 33
+    compileSdk 35
+    // Any modern NDK compiles the C++17 gait code identically. Pinned so CI /
+    // fresh checkouts are reproducible; install with:
+    //   sdkmanager "ndk;29.0.14206865"
     ndkVersion "29.0.14206865"
 
     buildFeatures {

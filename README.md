@@ -156,16 +156,33 @@ which way it's facing without any extra hardware.
 
 ## Building
 
-you'll need **Android Studio** (or a standalone Gradle + Android SDK), **JDK 17+**,
-**Android SDK 33**, and the **NDK** for the native gait / inverse-kinematics module.
+easiest path is **Android Studio** — open the project, let it sync, hit Run. it
+brings its own JDK and offers to grab any missing SDK/NDK bits, so there's nothing
+else to do.
+
+from the command line you just need a **JDK (anything from 17 to 25 works)** and the
+**Android SDK**. the wrapper pins the rest — Gradle 9.1 and the Android Gradle Plugin
+— so it builds the same everywhere.
 
 ```bash
+# point Gradle at your SDK (skip if $ANDROID_HOME is already set)
+echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties   # macOS
+# echo "sdk.dir=$HOME/Android/Sdk"       > local.properties   # Linux
+
+# grab the pinned platform + NDK once
+sdkmanager "platforms;android-35" "ndk;29.0.14206865" "cmake;3.22.1"
+
 # debug APK
 ./gradlew :app:assembleDebug
 # → app/build/outputs/apk/debug/app-debug.apk
 
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+> [!NOTE]
+> any modern JDK is fine since Gradle 9.1 runs on 17–25. if you ever see
+> `Unsupported class file major version`, you're on an old standalone `gradle` —
+> always go through `./gradlew` so the pinned version is used.
 
 the `tools/` directory has the Python harnesses I used during the reconstruction:
 `capture/` pulls reference traces off the original, `oracle/` diffs the rebuild
