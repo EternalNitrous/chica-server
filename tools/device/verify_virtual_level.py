@@ -29,7 +29,7 @@ STEPS = [
 def capture(apk: Path, out: Path) -> None:
     command = [
         sys.executable,
-        str(ROOT / "tools" / "capture_control_logcat.py"),
+        str(ROOT / "tools" / "capture" / "capture_control_logcat.py"),
         "--out",
         str(out),
         "--apk",

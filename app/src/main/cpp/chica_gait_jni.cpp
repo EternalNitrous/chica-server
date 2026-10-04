@@ -397,10 +397,12 @@ bool beginPoseRamp(Engine& engine,
 
     for (int leg : requested) {
         apk_model::Vec3 neutral = apk_model::neutralFootForBody(engine.config, timed.start, {}, leg);
-        timed.target.feet[leg] = neutral;
         double dx = neutral.x - timed.start.feet[leg].x;
         double dy = neutral.y - timed.start.feet[leg].y;
         if (threshold < 0.0 || ((dx * dx) + (dy * dy)) > (threshold * threshold)) {
+            // p3.a.M builds its target for iArr2 (selected legs) only. Keep
+            // all other feet untouched when committing the terminal frame.
+            timed.target.feet[leg] = neutral;
             timed.movingLegs.push_back(leg);
         }
     }
@@ -542,20 +544,24 @@ std::array<int, 18> stepSetPose(Engine& engine, apk_model::Pose target, double d
 // layer 3 directly (no settling integrator). dR/dS are the original's
 // aVar.R()/S() (= the primary stick pair). z5 picks the pose form: true = dive
 // (y-translation + z-yaw), false = setrotate/flex (circular x/y translation).
-std::array<int, 18> stepSetSweep(Engine& engine, double dR, double dS, bool z5, double dtMs)
+std::array<int, 18> stepSetSweep(Engine& engine, double dR, double dS, bool z5, double dtMs,
+                               bool filterTarget = true)
 {
     // Smooth the stick toward its target (the original's worker lerps the target
     // pose by 0.05 each step before handing it to G), so joystick moves ease in
     // instead of snapping.
-    engine.sweepDR += 0.05 * (dR - engine.sweepDR);
-    engine.sweepDS += 0.05 * (dS - engine.sweepDS);
-    dR = engine.sweepDR;
-    dS = engine.sweepDS;
+    if (filterTarget) {
+        engine.sweepDR += 0.05 * (dR - engine.sweepDR);
+        engine.sweepDS += 0.05 * (dS - engine.sweepDS);
+        dR = engine.sweepDR;
+        dS = engine.sweepDS;
+    }
     double mag = std::sqrt((dR * dR) + (dS * dS));
     double rate = std::min(1.0, std::max(-1.0, (dR + dS) * 8.0)) * 360.0 * mag;
     engine.sweepAngle += (std::max(0.0, dtMs) / 1000.0) * rate;
-    while (engine.sweepAngle >= 360.0) engine.sweepAngle -= 360.0;
-    while (engine.sweepAngle < 0.0) engine.sweepAngle += 360.0;
+    // p3.a.G wraps once, including after an unusually long frame interval.
+    if (engine.sweepAngle >= 360.0) engine.sweepAngle -= 360.0;
+    else if (engine.sweepAngle < 0.0) engine.sweepAngle += 360.0;
     double a = (engine.sweepAngle * M_PI) / 180.0;
     double sa = std::sin(a);
     double ca = std::cos(a);
@@ -980,10 +986,10 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativePoseRampToNeutral(
     std::vector<int> moving;
     for (int leg : requested) {
         apk_model::Vec3 neutral = apk_model::neutralFootForBody(engine->config, start, {}, leg);
-        target.feet[leg] = neutral;
         double dx = neutral.x - start.feet[leg].x;
         double dy = neutral.y - start.feet[leg].y;
         if (threshold < 0.0 || ((dx * dx) + (dy * dy)) > (threshold * threshold)) {
+            target.feet[leg] = neutral;
             moving.push_back(leg);
         }
     }
@@ -1456,6 +1462,99 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeClearSetPose(
     return toPulseArray(env, engine->lastPulses);
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeKeepSetPose(
+        JNIEnv*, jclass, jlong handle)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) return;
+    // p3.a.N() changes layer bookkeeping without staging a new servo frame.
+    engine->layers[0] = apk_model::addPose(engine->layers[0], engine->layers[3]);
+    engine->layers[3] = {};
+    // The combined pose and last staged frame stay unchanged, including any
+    // concurrent walk/CoG layer; N() only changes the layer bookkeeping.
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeStepSetWorker(
+        JNIEnv* env, jclass, jlong handle, jdoubleArray localState,
+        jdoubleArray localTarget, jint sweepMode, jdouble dtMs)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) return env->NewIntArray(0);
+    std::array<double, 7> state;
+    std::array<double, 6> target;
+    env->GetDoubleArrayRegion(localState, 0, 7, state.data());
+    env->GetDoubleArrayRegion(localTarget, 0, 6, target.data());
+    // JNI access is serialized by ChicaGaitEngine. The B velocity/G angle are
+    // local to this worker, while its result is written to shared layer 3.
+    const auto savedVelocity = engine->setVelocity;
+    const double savedAngle = engine->sweepAngle;
+    engine->setVelocity = {{state[0], state[1], state[2]}, {state[3], state[4], state[5]}};
+    engine->sweepAngle = state[6];
+    if (sweepMode == 0) {
+        engine->lastPulses = stepSetPose(*engine,
+                {{target[0], target[1], target[2]}, {target[3], target[4], target[5]}}, dtMs);
+    } else {
+        engine->lastPulses = stepSetSweep(*engine, target[0], target[1], sweepMode == 1, dtMs, false);
+    }
+    const auto& v = engine->setVelocity;
+    state = {v.xyz.x, v.xyz.y, v.xyz.z, v.uvw.x, v.uvw.y, v.uvw.z, engine->sweepAngle};
+    env->SetDoubleArrayRegion(localState, 0, 7, state.data());
+    engine->setVelocity = savedVelocity;
+    engine->sweepAngle = savedAngle;
+    return toPulseArray(env, engine->lastPulses);
+}
+
+extern "C" JNIEXPORT jdoubleArray JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeBeginLayerFadeContext(
+        JNIEnv* env, jclass, jlong handle)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) return env->NewDoubleArray(0);
+    apk_model::Pose combined = {};
+    for (const auto& layer : engine->layers) combined = apk_model::addPose(combined, layer);
+    combined = apk_model::addPose(combined, engine->state.cog_layer);
+    engine->state.cog_layer = {};
+    engine->layers = {};
+    engine->layers[0] = combined;
+    const auto& b = engine->state.body;
+    std::array<double, 30> context = {
+        combined.xyz.x, combined.xyz.y, combined.xyz.z, combined.uvw.x, combined.uvw.y, combined.uvw.z,
+        b.body.xyz.x, b.body.xyz.y, b.body.xyz.z, b.body.uvw.x, b.body.uvw.y, b.body.uvw.z,
+    };
+    for (int leg = 0; leg < 6; ++leg) {
+        context[12 + 3 * leg] = b.feet[leg].x;
+        context[13 + 3 * leg] = b.feet[leg].y;
+        context[14 + 3 * leg] = b.feet[leg].z;
+    }
+    jdoubleArray result = env->NewDoubleArray(30);
+    env->SetDoubleArrayRegion(result, 0, 30, context.data());
+    return result;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeLayerFadeContext(
+        JNIEnv* env, jclass, jlong handle, jdoubleArray rawContext, jdouble amount, jboolean finish)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) return env->NewIntArray(0);
+    std::array<double, 30> c;
+    env->GetDoubleArrayRegion(rawContext, 0, 30, c.data());
+    apk_model::Pose layer = {{c[0], c[1], c[2]}, {c[3], c[4], c[5]}};
+    const double magnitude = layerMagnitude(layer);
+    if (finish == JNI_TRUE) layer = {};
+    else if (magnitude > 0.0 && amount < magnitude) scalePoseInPlace(layer, (magnitude - amount) / magnitude);
+    engine->layers[0] = layer;
+    engine->state.body.body = {{c[6], c[7], c[8]}, {c[9], c[10], c[11]}};
+    for (int leg = 0; leg < 6; ++leg) engine->state.body.feet[leg] = {c[12 + 3 * leg], c[13 + 3 * leg], c[14 + 3 * leg]};
+    c[0] = layer.xyz.x; c[1] = layer.xyz.y; c[2] = layer.xyz.z;
+    c[3] = layer.uvw.x; c[4] = layer.uvw.y; c[5] = layer.uvw.z;
+    env->SetDoubleArrayRegion(rawContext, 0, 30, c.data());
+    engine->lastPulses = toPulsesFromPose(*engine);
+    return toPulseArray(env, engine->lastPulses);
+}
+
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeStepSetSweep(
         JNIEnv* env,
@@ -1530,6 +1629,16 @@ Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeCalibrationCurrentPu
     }
     engine->lastPulses = toPulsesFromPose(*engine);
     return toPulseArray(env, engine->lastPulses);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_makeyourpet_chicaserver_gait_ChicaGaitEngine_nativeBeginCalibration(
+        JNIEnv*, jclass, jlong handle)
+{
+    auto* engine = fromHandle(handle);
+    if (engine == nullptr) return;
+    engine->state.body.body = {};
+    engine->state.body.feet = engine->config.neutral_feet;
 }
 
 extern "C" JNIEXPORT jintArray JNICALL

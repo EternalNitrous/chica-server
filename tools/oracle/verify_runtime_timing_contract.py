@@ -126,6 +126,62 @@ def main() -> int:
     if "gaitEngine.beginWalkSession();" not in worker_start:
         raise AssertionError("new walk worker does not reset its source-local phase/anchors")
 
+    # d.n0 replaces f.h with a complete target; z0.o.b(true, ...) leaves an
+    # already-running B/G worker and its dive/flex form unchanged. These guards
+    # supplement paired APK entry captures; they do not prove trajectory parity.
+    set_command = section(source, "private void applySetCommand(String command)",
+                          "private void resetSetControls()")
+    before_mapping = set_command.split('if (command.startsWith("setxy:"))', 1)[0]
+    for axis in ("lastPrimaryX", "lastPrimaryY", "lastSecondaryX", "lastSecondaryY",
+                 "lastTertiaryX", "lastTertiaryY"):
+        if f"{axis} = 0.0d;" not in before_mapping:
+            raise AssertionError(f"set command retains an omitted target axis: {axis}")
+    latched_mode = re.search(
+        r"if \(!setWorkerRunning\) \{(?P<body>.*?)\n        \}",
+        set_command, re.DOTALL,
+    )
+    if latched_mode is None:
+        raise AssertionError("set command does not latch its worker motion type")
+    assignments = re.findall(r"setSweepMode\s*=\s*[012]\s*;", set_command)
+    guarded_assignments = re.findall(r"setSweepMode\s*=\s*[012]\s*;", latched_mode["body"])
+    if len(assignments) != 3 or assignments != guarded_assignments:
+        raise AssertionError("active set command can replace its worker motion type")
+    set_worker = section(source, "private void startOriginalSetWorkerLocked()",
+                         "private void startOriginalQuadSetWorkerLocked()")
+    for statement in (
+        "final boolean sweepRoutine = setSweepMode != 0;",
+        "final int workerSweepMode = sweepRoutine ? (setSweepMode == 1 ? 1 : 2) : 0;",
+        "final boolean keepStaticPose = keepMode;",
+        "double[] workerState = new double[7];",
+        "double[] filteredSetPoseTarget = new double[6];",
+        "advanceOriginalSetPoseFrame(workerSweepMode, workerState, filteredSetPoseTarget, dtMs);",
+        "sleepOriginalPoseStep(10.0d);",
+        "filteredSetPoseTarget[i] *= 0.9d;",
+        "localSetTargetMagnitude(filteredSetPoseTarget) < 0.01d",
+        "gaitEngine.keepSetPose();",
+        "if (fadeLayer) publishOriginalLayerFade();",
+    ):
+        if statement not in set_worker:
+            raise AssertionError(f"source set worker contract missing: {statement}")
+    if "setPoseQuietFrames" in source or "setPoseLayerMagnitude" in set_worker:
+        raise AssertionError("set release still stops on an invented output-layer rule")
+    clear_set = section(source, "private void resetSetControls()", "private boolean originalMotionBusy()")
+    if "setWorkerRunning = false;" not in clear_set:
+        raise AssertionError("setclear does not release the motion flag immediately")
+    if "if (!keepMode) publishOriginalLayerFade();" not in source:
+        raise AssertionError("turning keep off does not fade the saved pose")
+    motion_busy = section(source, "private boolean originalMotionBusy()", "private boolean isQuadOutputMode()")
+    if "return activeWalk || setWorkerRunning;" not in motion_busy:
+        raise AssertionError("motion busy differs from source flags during walkclear")
+    sit = section(source, "private boolean setOriginalStanding", "private void setOriginalBlockMode")
+    if "if (originalMotionBusy()) return false;" not in sit:
+        raise AssertionError("sit is not guarded against active source motion flags")
+    calibration = section(source, "private void runOriginalCalibrate()", "private static String animationTraceJson")
+    for statement in ("gaitEngine.beginCalibration();", "while (true)",
+                      "contacted[leg] = !Double.isNaN(touches[leg]) && touches[leg] > 0.5d;"):
+        if statement not in calibration:
+            raise AssertionError(f"source calibration contract missing: {statement}")
+
     if "ORIGINAL_STOP_VECTOR_THRESHOLD = 0.2d;" not in source:
         raise AssertionError("walk stop threshold differs from z0.e")
     gait_step = section(source, "private boolean stepOriginalGait()", "private void startOriginalWalkWorkerLocked")
@@ -137,19 +193,21 @@ def main() -> int:
     ):
         if statement not in gait_step:
             raise AssertionError(f"walk stop state machine missing: {statement}")
+    if "if (!relayStatus || !standing" in gait_step:
+        raise AssertionError("draining gait worker is incorrectly cancelled by sit/torque flags")
     ack_ramp = section(source, "private void handleAckRampLocked", "private void enterOriginalHomePose")
     if "publishOriginalHomePose(50.0d - ackCount);" not in ack_ramp:
         raise AssertionError("ACK home correction z0.o.g(50-ackCount) is missing")
-    layer_fade = section(source, "private void publishOriginalWalkLayerFade()", "private static double originalFrameDt")
+    layer_fade = section(source, "private void publishOriginalLayerFade()", "private static double originalFrameDt")
     for statement in (
-        "gaitEngine.beginWalkLayerFade()",
+        "gaitEngine.beginLayerFadeContext()",
         "0.05000000074505806d",
         "currentMode().speed * 0.1d",
-        "gaitEngine.finishWalkLayerFade()",
+        "gaitEngine.finishLayerFadeContext(fadeContext)",
     ):
         if statement not in layer_fade:
             raise AssertionError(f"post-walk p3.a.p layer fade missing: {statement}")
-    worker = section(source, "private void startOriginalWalkWorkerLocked()", "private void publishOriginalWalkLayerFade()")
+    worker = section(source, "private void startOriginalWalkWorkerLocked()", "private void publishOriginalLayerFade()")
     if "keepMode && modeIndex == 4" not in worker or "if (!preserveKeptQuadrupedPose)" not in worker:
         raise AssertionError("kept quadruped gait does not preserve the source p3.a.p exception")
 
@@ -191,9 +249,10 @@ def main() -> int:
 
     rendered = ", ".join(f"{name}={speeds[name]:g}" for name in EXPECTED_SPEEDS)
     print(
-        "runtime timing contract exact=true "
+        "runtime source contract passed (not a timing measurement) "
         f"({rendered}; startup=seated; servo heartbeat=>7ms; telemetry=every-other; "
-        "connected-bps; ui=83ms; persistent-walk-worker; anchor-clear-stop; phase-reset; layer-fade; ack-home; trace=off)"
+        "connected-bps; ui=83ms; persistent-walk-worker; latched-set-worker; complete-set-target; "
+        "anchor-clear-stop; phase-reset; layer-fade; ack-home; trace=off)"
     )
     return 0
 

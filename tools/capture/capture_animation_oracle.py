@@ -376,7 +376,12 @@ def parse_steps(raw_steps: list[str]) -> list[tuple[str, float]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", type=Path, default=Path("../oracle/animation_primitives.jsonl"))
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path(__file__).resolve().parents[4]
+        / "research-private" / "oracle" / "animation_primitives.jsonl",
+    )
     parser.add_argument("--step", action="append", default=[])
     parser.add_argument("--ack-interval", type=float, default=0.10)
     parser.add_argument("--no-restart", action="store_true")

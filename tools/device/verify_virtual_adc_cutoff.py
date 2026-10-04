@@ -41,7 +41,7 @@ def run_capture(apk: Path, outdir: Path, name: str, steps: list[str]) -> Path:
     out = outdir / f"rebuilt_{name}.jsonl"
     command = [
         sys.executable,
-        str(ROOT / "tools" / "capture_control_logcat.py"),
+        str(ROOT / "tools" / "capture" / "capture_control_logcat.py"),
         "--out",
         str(out),
         "--apk",

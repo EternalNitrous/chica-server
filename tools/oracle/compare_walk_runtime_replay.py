@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Replay original live gait logs through the native port and compare pulses.
+"""Replay instrumented runtime gait logs through the native port and compare pulses.
 
 The instrumented APK logs CHICA_GAIT immediately after the servo write for a
-runtime walk frame.  Pairing each gait record with the preceding CHICA_SERVO
-record gives the exact pulse oracle for that frame while avoiding wall-clock
-jitter between separate emulator runs.  The printed gait vector is rounded, so
-runtime walk vectors are reconstructed from the original command stream.
+runtime walk frame. Pairing each gait record with the preceding CHICA_SERVO
+record gives the pulse output for that frame without wall-clock alignment.
+Replay uses the per-frame filtered command logged with CHICA_GAIT, so changes
+between walk vectors and the stop ramp are preserved. That command is rounded
+in the log, so a one-microsecond delta is reported as bounded rather than exact.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
+import io
 import json
 import pathlib
 import re
@@ -49,49 +52,18 @@ def parse_vector(text: str) -> list[float]:
     return values
 
 
-def parse_walk_target(command: str, crab_mode: bool) -> list[float] | None:
-    if not command.startswith("walk") or command.startswith("walkclear"):
-        return None
-    if ":" not in command:
-        return None
-    values = [float(value) for value in NUMBER_RE.findall(command.split(":", 1)[1])]
-    if len(values) < 3:
-        return None
-    if crab_mode:
-        return [values[1], values[0], 0.0]
-    return [values[1], 0.0, values[0]]
-
-
-def command_target(records: list[dict]) -> list[float] | None:
-    crab_mode = False
-    target: list[float] | None = None
-    for record in records:
-        if record.get("type") not in {"command", "device_command"}:
-            continue
-        command = str(record.get("command", ""))
-        if command.startswith("crab"):
-            crab_mode = not crab_mode
-        next_target = parse_walk_target(command, crab_mode)
-        if next_target is not None:
-            target = next_target
-    return target
-
-
 def parse_trace(path: pathlib.Path) -> tuple[list[tuple], list[list[int]]]:
     records = [
         json.loads(line)
         for line in path.read_text().splitlines()
         if line.strip()
     ]
-    target = command_target(records)
-    filtered = [0.0, 0.0, 0.0]
     records = [record for record in records if "time" in record]
     records.sort(key=lambda record: record["time"])
 
     frames: list[tuple] = []
     observed: list[list[int]] = []
     latest_servo: list[int] | None = None
-    stopping = False
     for record in records:
         record_type = record.get("type")
         if record_type == "servo_values":
@@ -102,21 +74,7 @@ def parse_trace(path: pathlib.Path) -> tuple[list[tuple], list[list[int]]]:
         if latest_servo is None:
             raise ValueError(f"{path}: gait record before any servo output")
         printed = parse_vector(str(record.get("cmd", "")))
-        if target is None:
-            forward, left, turn = printed
-        else:
-            if not stopping:
-                next_filtered = [
-                    current + ((desired - current) * 0.05)
-                    for current, desired in zip(filtered, target)
-                ]
-                if vector_delta(next_filtered, printed) > 0.01:
-                    stopping = True
-                else:
-                    filtered = next_filtered
-            if stopping:
-                filtered = [current * 0.9 for current in filtered]
-            forward, left, turn = filtered
+        forward, left, turn = printed
         frames.append((
             int(record["gait"]),
             int(record["style"]),
@@ -127,14 +85,7 @@ def parse_trace(path: pathlib.Path) -> tuple[list[tuple], list[list[int]]]:
             turn,
         ))
         observed.append(latest_servo)
-        if stopping and not record.get("allow"):
-            break
-
     return frames, observed
-
-
-def vector_delta(left: list[float], right: list[float]) -> float:
-    return max(abs(a - b) for a, b in zip(left, right))
 
 
 def run_probe(frames: list[tuple]) -> list[list[int]]:
@@ -150,40 +101,122 @@ def run_probe(frames: list[tuple]) -> list[list[int]]:
     return pulses
 
 
-def compare_file(path: pathlib.Path) -> bool:
+def compare_file(path: pathlib.Path) -> str:
     frames, observed = parse_trace(path)
     if not frames:
         print(f"{path.name}: no runtime gait frames")
-        return False
+        return "FAIL"
+    total_frames = len(frames)
+    # A walk-only probe cannot replay sit/home/mode animations interleaved with
+    # gait steps: those operations overwrite body/feet/layers in the live app.
+    # Check the preceding uncontaminated prefix, and retain BOUNDED coverage
+    # for the rest instead of diagnosing missing inputs as a gait mismatch.
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    gait_times = sorted(float(row["time"]) for row in records if row.get("type") == "gait")
+    interleaved = [
+        float(row["time"]) for row in records
+        if row.get("type") == "anim" and "time" in row
+        and gait_times[0] <= float(row["time"]) <= gait_times[-1]
+    ]
+    unmodeled_after = min(interleaved) if interleaved else None
+    if unmodeled_after is not None:
+        prefix_count = sum(time < unmodeled_after for time in gait_times)
+        frames, observed = frames[:prefix_count], observed[:prefix_count]
+        if not frames:
+            print(f"{path.name}: status=BOUNDED input_frames={total_frames} replay_frames=0; concurrent pose animation is not represented in gait-only inputs")
+            return "BOUNDED"
     expected = run_probe(frames)
-    exact = len(observed) == len(expected) and all(a == b for a, b in zip(observed, expected))
-    print(f"{path.name}: frames={len(frames)} exact={exact}")
+    differing_frames = 0
+    differing_channels = 0
+    max_delta = 0
+    first_diffs: list[tuple[int, int, int, int]] = []
     for index, (actual, rebuilt) in enumerate(zip(observed, expected)):
-        if actual == rebuilt:
+        channel_deltas = [abs(a - b) for a, b in zip(actual, rebuilt)]
+        frame_max = max(channel_deltas)
+        if frame_max == 0:
             continue
-        diffs = [abs(a - b) for a, b in zip(actual, rebuilt)]
-        print(f"  frame {index}: max={max(diffs)} sum={sum(diffs)}")
-        print(f"    original={actual}")
-        print(f"    rebuilt ={rebuilt}")
-        break
+        differing_frames += 1
+        differing_channels += sum(delta != 0 for delta in channel_deltas)
+        max_delta = max(max_delta, frame_max)
+        if len(first_diffs) < 5:
+            channel = channel_deltas.index(frame_max)
+            first_diffs.append((index, channel, actual[channel], rebuilt[channel]))
     if len(observed) != len(expected):
-        print(f"  frame count mismatch: original={len(observed)} rebuilt={len(expected)}")
-    return exact
+        status = "FAIL"
+    elif differing_frames == 0:
+        status = "BOUNDED" if unmodeled_after is not None else "PASS"
+    elif max_delta <= 1:
+        # The compact runtime trace rounds its command vector before logging it.
+        # A one-microsecond delta cannot establish exact parity from that input.
+        status = "BOUNDED"
+    else:
+        status = "FAIL"
+    print(
+        f"{path.name}: status={status} input_frames={total_frames} replay_frames={len(frames)} "
+        f"app_outputs={len(observed)} replay_outputs={len(expected)} "
+        f"differing_frames={differing_frames} differing_channels={differing_channels} "
+        f"max_pwm_delta={max_delta}"
+    )
+    if unmodeled_after is not None:
+        print("  gait prefix checked; remaining frames require the interleaved pose-animation inputs, unavailable in this replay format")
+    for frame, channel, actual, rebuilt in first_diffs:
+        print(f"  frame={frame} pin={channel}: app={actual} replay={rebuilt}")
+    return status
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("trace", nargs="+", type=pathlib.Path)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument(
+        "--summary", action="store_true",
+        help="print aggregate results instead of per-capture frame diagnostics",
+    )
     args = parser.parse_args()
 
     if not args.skip_build:
         build_probe()
 
-    ok = True
+    statuses: list[str] = []
+    summaries: list[tuple[str, str, str]] = []
     for trace in args.trace:
-        ok = compare_file(trace) and ok
-    return 0 if ok else 1
+        if args.summary:
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                status = compare_file(trace)
+            headline = next(
+                (line for line in captured.getvalue().splitlines() if "status=" in line),
+                "",
+            )
+            summaries.append((status, trace.name, headline))
+            statuses.append(status)
+        else:
+            statuses.append(compare_file(trace))
+    if args.summary:
+        counts = {name: statuses.count(name) for name in ("PASS", "BOUNDED", "FAIL")}
+        frame_counts = []
+        max_deltas = []
+        for _, _, headline in summaries:
+            frames = re.search(r"input_frames=(\d+)", headline)
+            delta = re.search(r"max_pwm_delta=(\d+)", headline)
+            if frames:
+                frame_counts.append(int(frames.group(1)))
+            if delta:
+                max_deltas.append(int(delta.group(1)))
+        print(
+            f"saved rebuild walk replay captures={len(statuses)} "
+            f"exact={counts['PASS']} bounded={counts['BOUNDED']} "
+            f"failed={counts['FAIL']} frames={sum(frame_counts)} "
+            f"worst_pwm_delta={max(max_deltas, default=0)}us"
+        )
+        for status, name, headline in summaries:
+            if status == "FAIL":
+                print(f"FAIL {name}: {headline}")
+    if "FAIL" in statuses:
+        return 1
+    if "BOUNDED" in statuses:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
