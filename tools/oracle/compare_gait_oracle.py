@@ -143,8 +143,10 @@ def compare_file(path: pathlib.Path) -> bool:
         print(f"{path.name}: no gait frames")
         return False
     probe = run_probe(frames, seed_pulses, quad_pair)
-    servos = servos[:len(probe)]
-    exact = len(servos) == len(probe) and all(a == b for a, b in zip(servos, probe))
+    if len(servos) != len(probe):
+        print(f"{path.name}: frame count mismatch: original={len(servos)} rebuilt={len(probe)}")
+        return False
+    exact = all(a == b for a, b in zip(servos, probe))
     print(f"{path.name}: frames={len(frames)} exact={exact}")
     for index, (original, rebuilt) in enumerate(zip(servos, probe)):
         if original == rebuilt:
@@ -153,8 +155,6 @@ def compare_file(path: pathlib.Path) -> bool:
         print(f"  frame {index}: max={max(diffs)} sum={sum(diffs)}")
         print(f"    original={original}")
         print(f"    rebuilt ={rebuilt}")
-    if len(servos) != len(probe):
-        print(f"  frame count mismatch: original={len(servos)} rebuilt={len(probe)}")
     return exact
 
 

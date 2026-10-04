@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 
@@ -70,7 +71,11 @@ def rebuilt_values(path: Path) -> list[list[int]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--oracle-dir", type=Path, default=Path("../oracle"))
+    default_oracle = Path(os.environ.get(
+        "CHICA_ORACLE_DIR",
+        Path(__file__).resolve().parents[4] / "research-private" / "oracle",
+    ))
+    parser.add_argument("--oracle-dir", type=Path, default=default_oracle)
     parser.add_argument("--pairs", nargs="+", default=["03", "14", "25"])
     args = parser.parse_args()
 

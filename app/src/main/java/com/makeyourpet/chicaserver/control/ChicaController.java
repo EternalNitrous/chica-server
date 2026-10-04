@@ -26,7 +26,6 @@ public final class ChicaController {
     private final double ORIGINAL_LEG_SITTING_Z;  // LEG_SITTING_Z from config (default -40)
     private final double ORIGINAL_QUAD_DISABLED_Z;  // z0.o:322 = femurScale*120 + LEG_CONNECTION_Z
     private static final double ORIGINAL_CALIBRATION_LOWER_STEP = -0.20000000298023224d;
-    private static final int ORIGINAL_CALIBRATION_MAX_POLLS = 3000;
     private static final double[] ORIGINAL_QUAD_SET25_STEP_MS = {215.2d, 423.2d, 419.2d, 414.4d, 412.8d};
     private static final double[] ORIGINAL_QUAD_SET25_BLEND = {
             0.0975d,
@@ -85,7 +84,7 @@ public final class ChicaController {
     private volatile boolean walkWorkerRunning = false;
     private volatile boolean setWorkerRunning = false;
     private volatile boolean levelWorkerRunning = false;
-    private volatile long setPoseDecayUntilMillis = 0L;
+    private volatile boolean setPoseTargetActive = false;
     // Continuous angular-sweep set-poses (the original's worker case 2, p3.a.G):
     // 0 = static set-pose integrator, 1 = dive (z5=true), 2 = setrotate/flex (z5=false).
     private volatile int setSweepMode = 0;
@@ -531,12 +530,9 @@ public final class ChicaController {
         } else if (command.startsWith("crab")) {
             crabMode = !crabMode;
         } else if (command.startsWith("keep")) {
-            // d.n0 keep branch: toggle the keep flag; when turned off, stand up
-            // if not busy (z0.o.i toggle, then z0.o.d(true, false)).
+            // d.n0 keep-off calls p() to fade the retained layer.
             keepMode = !keepMode;
-            if (!keepMode && !originalMotionBusy()) {
-                setOriginalStanding(true, false);
-            }
+            if (!keepMode) publishOriginalLayerFade();
         } else if (command.startsWith("home")) {
             enterOriginalHomePose();
         } else if (command.startsWith("bounce")) {
@@ -558,14 +554,16 @@ public final class ChicaController {
         } else if (command.startsWith("custom")) {
             applyOriginalMode(3);
         } else if (command.startsWith("quad")) {
-            applyOriginalMode(4, parseQuadDisabledLegs(command));
+            int[] disabledLegs = parseQuadDisabledLegs(command);
+            if (disabledLegs != null) applyOriginalMode(4, disabledLegs);
         } else if (command.startsWith("walkclear")) {
             requestOriginalWalkStop(true);
         } else if (command.startsWith("walk")) {
             boolean startingWalkWorker = !walkWorkerRunning;
             int previousWalkMode = walkModeIndex;
             int previousAnimation = animation;
-            applyWalkCommand(command);
+            // A malformed payload must not energize servos or start a zero/stale-target gait.
+            if (!applyWalkCommand(command)) return;
             if (!startingWalkWorker) {
                 // d.n0 updates only the shared target while z0.e is running.
                 walkModeIndex = previousWalkMode;
@@ -618,13 +616,13 @@ public final class ChicaController {
         }
     }
 
-    private void applyWalkCommand(String command) {
+    private boolean applyWalkCommand(String command) {
         if (command.startsWith("walkclear")) {
             requestOriginalWalkStop(true);
-            return;
+            return true;
         }
         double[] parts = parseTriple(command);
-        if (parts == null) return;
+        if (parts == null) return false;
         double forward = parts[1];
         double strafe = crabMode ? parts[0] : 0.0d;
         double turn = crabMode ? 0.0d : parts[0];
@@ -643,6 +641,7 @@ public final class ChicaController {
         } else if (command.startsWith("walkwave:")) {
             walkModeIndex = 10;
         }
+        return true;
     }
 
     private void applySetCommand(String command) {
@@ -650,9 +649,17 @@ public final class ChicaController {
             resetSetControls();
             return;
         }
-        setPoseDecayUntilMillis = 0L;
         double[] parts = parsePair(command);
         if (parts == null) return;
+        setPoseTargetActive = true;
+        // d.n0 replaces f.h with a complete six-axis target on every command.
+        // Axes omitted by the new command do not retain the previous target.
+        lastPrimaryX = 0.0d;
+        lastPrimaryY = 0.0d;
+        lastSecondaryX = 0.0d;
+        lastSecondaryY = 0.0d;
+        lastTertiaryX = 0.0d;
+        lastTertiaryY = 0.0d;
         // The original builds a p3.a(DDDDDD) holding two z0.m vectors (e, f) and
         // clamps EACH vector to unit *magnitude* (z0.m.e()/h()), not each axis
         // independently. For the two-axis commands both axes occupy one vector,
@@ -685,14 +692,18 @@ public final class ChicaController {
             lastPrimaryX = e[0];
             lastPrimaryY = e[1];
         }
-        // dive and setrotate route to the continuous angular sweep (G), not the
-        // static set-pose integrator. They differ only by pose form (z5).
-        if (command.startsWith("setdive:")) {
-            setSweepMode = 1;
-        } else if (command.startsWith("setrotate:")) {
-            setSweepMode = 2;
-        } else {
-            setSweepMode = 0;
+        // z0.o.b(true, ...) returns false while a set worker is active. The
+        // command updates its shared target but does not change that worker's
+        // B/G routine or latched dive/flex form. Replacing the routine here
+        // overwrote layer 3 and snapped an existing offset pose toward neutral.
+        if (!setWorkerRunning) {
+            if (command.startsWith("setdive:")) {
+                setSweepMode = 1;
+            } else if (command.startsWith("setrotate:")) {
+                setSweepMode = 2;
+            } else {
+                setSweepMode = 0;
+            }
         }
         if (isQuadOutputMode()) {
             publishOriginalFrame();
@@ -705,19 +716,18 @@ public final class ChicaController {
     }
 
     private void resetSetControls() {
-        if (lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d || setWorkerRunning) {
-            setPoseDecayUntilMillis = System.currentTimeMillis() + 1500L;
-        }
+        // d.n0 clears f.h. The worker keeps its already-filtered local target
+        // and consumes that target before entering its original release path.
+        setPoseTargetActive = false;
         lastPrimaryX = 0.0d;
         lastPrimaryY = 0.0d;
         lastSecondaryX = 0.0d;
         lastSecondaryY = 0.0d;
         lastTertiaryX = 0.0d;
         lastTertiaryY = 0.0d;
-        // Let the post-release decay ramp the orbit pose back down via the static
-        // integrator, then clearSetPose resets the sweep angle.
-        setSweepMode = 0;
+        // b(false) clears the motion flag immediately; the old thread drains
+        // with its private target/velocity while another worker may start.
+        setWorkerRunning = false;
     }
 
     private void setOriginalRelay(boolean enabled) {
@@ -748,6 +758,8 @@ public final class ChicaController {
             enterOriginalStandPose();
             standing = true;
         } else {
+            // z0.o.d(false, ...) rejects sitting while h() is true. walkclear
+            // clears f7158j immediately, even while its old thread finishes.
             if (originalMotionBusy()) return false;
             enterOriginalSitPose();
             standing = false;
@@ -799,7 +811,8 @@ public final class ChicaController {
     }
 
     private boolean originalMotionBusy() {
-        return activeWalk || walkWorkerRunning || setWorkerRunning || pendingStopStep || pendingWalkClear;
+        // z0.o.h() reads motion flags, not whether a draining walk thread lives.
+        return activeWalk || setWorkerRunning;
     }
 
     private boolean isQuadOutputMode() {
@@ -814,61 +827,94 @@ public final class ChicaController {
                 && quadrupedActiveLegs[3] == 4;
     }
 
-    private boolean stepOriginalSetPose() {
-        if (!relayStatus || !standing) return false;
-        long now = System.currentTimeMillis();
-        boolean hasTarget = lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d;
-        if (!hasTarget && now > setPoseDecayUntilMillis) {
-            setPoseDecayUntilMillis = 0L;
-            lastPulses = mergeActiveLegPulses(gaitEngine.clearSetPose());
-            publishOriginalFrame();
-            return false;
-        }
-        double dtMs = Math.max(0.0d, now - lastStepMillis) * currentMode().speed;
-        lastStepMillis = now;
-        if (setSweepMode != 0) {
-            // Continuous orbit: the held stick (lastPrimaryX/Y = the original's
-            // aVar.R()/S()) sets the sweep speed; the body keeps animating.
-            lastPulses = mergeActiveLegPulses(gaitEngine.stepSetSweep(
-                    lastPrimaryX,
-                    lastPrimaryY,
-                    setSweepMode == 1,
-                    dtMs));
-        } else {
-            lastPulses = mergeActiveLegPulses(gaitEngine.stepSetPose(
-                    lastPrimaryX,
-                    lastPrimaryY,
-                    lastTertiaryX,
-                    lastTertiaryY,
-                    lastSecondaryX,
-                    lastSecondaryY,
-                    dtMs));
-        }
+    private void approachSharedSetTarget(double[] filteredSetPoseTarget) {
+        // p3.a.x -> z0.m.f -> w8.i, including its floating-point order.
+        filteredSetPoseTarget[0] = lastPrimaryX * 0.05d + 0.95d * filteredSetPoseTarget[0];
+        filteredSetPoseTarget[1] = lastPrimaryY * 0.05d + 0.95d * filteredSetPoseTarget[1];
+        filteredSetPoseTarget[2] = lastTertiaryX * 0.05d + 0.95d * filteredSetPoseTarget[2];
+        filteredSetPoseTarget[3] = lastTertiaryY * 0.05d + 0.95d * filteredSetPoseTarget[3];
+        filteredSetPoseTarget[4] = lastSecondaryX * 0.05d + 0.95d * filteredSetPoseTarget[4];
+        filteredSetPoseTarget[5] = lastSecondaryY * 0.05d + 0.95d * filteredSetPoseTarget[5];
+    }
+
+    private double localSetTargetMagnitude(double[] filteredSetPoseTarget) {
+        double xyz = Math.sqrt(filteredSetPoseTarget[0] * filteredSetPoseTarget[0]
+                + filteredSetPoseTarget[1] * filteredSetPoseTarget[1]
+                + filteredSetPoseTarget[2] * filteredSetPoseTarget[2]);
+        double uvw = Math.sqrt(filteredSetPoseTarget[3] * filteredSetPoseTarget[3]
+                + filteredSetPoseTarget[4] * filteredSetPoseTarget[4]
+                + filteredSetPoseTarget[5] * filteredSetPoseTarget[5]);
+        return xyz + 4.0d * uvw;
+    }
+
+    private void advanceOriginalSetPoseFrame(int workerSweepMode, double[] workerState,
+                                             double[] filteredSetPoseTarget, double dtMs) {
+        lastPulses = mergeActiveLegPulses(gaitEngine.stepSetWorker(
+                workerState, filteredSetPoseTarget, workerSweepMode, dtMs));
         publishOriginalFrame();
-        return true;
     }
 
     private void startOriginalSetWorkerLocked() {
         if (setWorkerRunning) return;
         setWorkerRunning = true;
-        lastStepMillis = System.currentTimeMillis();
+        final boolean sweepRoutine = setSweepMode != 0;
         Thread thread = new Thread(() -> {
-            while (true) {
-                synchronized (ChicaController.this) {
-                    if (!stepOriginalSetPose()) {
-                        setWorkerRunning = false;
-                        return;
-                    }
-                }
-                try {
-                    Thread.sleep(10L);
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
+            final int workerSweepMode = sweepRoutine ? (setSweepMode == 1 ? 1 : 2) : 0;
+            final boolean keepStaticPose = keepMode;
+            // z0.e owns a local target, B velocity, G angle and frame clock.
+            // setclear releases b(false) immediately, allowing overlapping
+            // workers; none of these locals may be reset by another worker.
+            double[] filteredSetPoseTarget = new double[6];
+            double[] workerState = new double[7];
+            long previousFrameMillis = System.currentTimeMillis();
+            boolean hasLocalTarget;
+            synchronized (ChicaController.this) {
+                hasLocalTarget = setPoseTargetActive;
+                if (hasLocalTarget) approachSharedSetTarget(filteredSetPoseTarget);
+            }
+            boolean hasPreviousTarget = false;
+            try {
+                while (hasLocalTarget || hasPreviousTarget) {
+                    long now = System.currentTimeMillis();
+                    double dtMs = Math.max(0.0d, now - previousFrameMillis) * currentMode().speed;
+                    previousFrameMillis = now;
                     synchronized (ChicaController.this) {
-                        setWorkerRunning = false;
+                        advanceOriginalSetPoseFrame(workerSweepMode, workerState, filteredSetPoseTarget, dtMs);
                     }
-                    return;
+                    sleepOriginalPoseStep(10.0d);
+                    boolean fadeLayer = false;
+                    synchronized (ChicaController.this) {
+                        if (hasLocalTarget) {
+                            hasPreviousTarget = true;
+                            if (setPoseTargetActive) {
+                                approachSharedSetTarget(filteredSetPoseTarget);
+                            } else {
+                                hasLocalTarget = false;
+                            }
+                        } else if (workerSweepMode != 0) {
+                            fadeLayer = true;
+                            hasPreviousTarget = false;
+                        } else if (keepStaticPose) {
+                            gaitEngine.keepSetPose();
+                            hasPreviousTarget = false;
+                        } else {
+                            // B executes BEFORE H(0.9); p() starts below 0.01.
+                            for (int i = 0; i < filteredSetPoseTarget.length; i++) {
+                                filteredSetPoseTarget[i] *= 0.9d;
+                            }
+                            if (localSetTargetMagnitude(filteredSetPoseTarget) < 0.01d) {
+                                fadeLayer = true;
+                                hasPreviousTarget = false;
+                            }
+                        }
+                    }
+                    if (fadeLayer) publishOriginalLayerFade();
+                }
+            } finally {
+                synchronized (ChicaController.this) {
+                    // b(false) may also clear a newer worker's motion flag,
+                    // matching the source's shared flag and independent loops.
+                    setWorkerRunning = false;
                 }
             }
         }, "chica-original-set");
@@ -986,15 +1032,13 @@ public final class ChicaController {
     }
 
     private void enterOriginalHomePose() {
-        long started = System.currentTimeMillis();
         publishOriginalHomePose(-1.0d);
-        sleepRemaining(started, originalHomeBusyMillis(modeIndex));
     }
 
     private void publishOriginalHomePose(double threshold) {
-        if (activeWalk || lastPrimaryX != 0.0d || lastPrimaryY != 0.0d || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d) {
-            return;
-        }
+        if (originalMotionBusy()) return;
+        // z0.o.g() powers torque before M(), even when no feet need moving.
+        setOriginalRelay(true);
         ModeParams mode = currentMode();
         double lift = standing ? mode.stepLift : 15.0d;
         double layerBlend = standing ? mode.animationFactor : 0.0d;
@@ -1022,16 +1066,20 @@ public final class ChicaController {
     }
 
     private void applyOriginalMode(int requestedMode, int[] disabledQuadLegs) {
-        long started = System.currentTimeMillis();
         int nextMode = Math.max(0, Math.min(4, requestedMode));
-        if (nextMode == modeIndex || activeWalk || lastPrimaryX != 0.0d || lastPrimaryY != 0.0d
-                || lastSecondaryX != 0.0d || lastSecondaryY != 0.0d || lastTertiaryX != 0.0d || lastTertiaryY != 0.0d) {
+        if (nextMode == modeIndex || originalMotionBusy()) {
             return;
         }
         if (nextMode == 4) {
-            applyOriginalQuadMode(started, disabledQuadLegs == null ? new int[] {1, 4} : disabledQuadLegs);
+            applyOriginalQuadMode(disabledQuadLegs == null ? new int[] {1, 4} : disabledQuadLegs);
             return;
         }
+
+        boolean restoreRelayOff = !relayStatus;
+        applyOriginalHexMode(nextMode, restoreRelayOff);
+    }
+
+    private void applyOriginalHexMode(int nextMode, boolean restoreRelayOff) {
         ModeParams mode = ORIGINAL_MODES[nextMode];
         int oldModeIndex = modeIndex;
         boolean wasStanding = standing;
@@ -1097,15 +1145,25 @@ public final class ChicaController {
         if (standing) {
             publishTimedBodyZRamp(mode.bodyLift, 400.0d / mode.speed);
         }
+        // o.i() updates the mode parameters and any standing body lift before
+        // calling g(-1). g() powers the relay only for the home-pose ramp, then
+        // restores its prior state. Keep relay/FLAGS transitions in that order.
+        if (restoreRelayOff) {
+            relayStatus = true;
+            servoBackend.setRelay(true);
+        }
         enterOriginalHomePose();
+        if (restoreRelayOff) {
+            relayStatus = false;
+            servoBackend.setRelay(false);
+        }
         if (oldModeIndex == 4 && wasStanding) {
             enterOriginalStandPose();
             standing = true;
         }
-        sleepRemaining(started, originalModeBusyMillis(nextMode));
     }
 
-    private void applyOriginalQuadMode(long startedMillis, int[] disabledLegs) {
+    private void applyOriginalQuadMode(int[] disabledLegs) {
         int oldModeIndex = modeIndex;
         boolean oldRelayStatus = relayStatus;
         boolean oldStanding = standing;
@@ -1119,18 +1177,20 @@ public final class ChicaController {
         relayStatus = true;
         servoBackend.setRelay(true);
 
-        int[] normalizedDisabled = normalizeDisabledQuadLegs(disabledLegs);
+        // The APK uses the supplied pair verbatim. A repeated index disables
+        // one leg; the parser rejects invalid indices instead of substituting L2/R2.
+        int[] requestedDisabled = disabledLegs.clone();
         // Original tucks the disabled legs at STANDARD radius+40 (h.f7104n[0]),
         // not the outgoing mode's radius; duration uses the outgoing speed.
         publishTimedShapeRampForLegs(
-                normalizedDisabled,
+                requestedDisabled,
                 ORIGINAL_MODES[0].radius + 40.0d,
                 ORIGINAL_QUAD_DISABLED_Z,
                 80.0d,
                 1.0d,
                 700.0d / oldMode.speed);
 
-        quadrupedActiveLegs = activeLegComplement(normalizedDisabled);
+        quadrupedActiveLegs = activeLegComplement(requestedDisabled);
         activeOutputLegs = quadrupedActiveLegs;
         ModeParams quadMode = ORIGINAL_MODES[4];
         modeIndex = 4;
@@ -1154,28 +1214,6 @@ public final class ChicaController {
             servoBackend.setRelay(false);
         }
 
-        sleepRemaining(startedMillis, originalModeBusyMillis(4));
-    }
-
-    private static long originalModeBusyMillis(int mode) {
-        if (mode == 2) return 3000L;
-        if (mode == 4) return 3300L;
-        return 1400L;
-    }
-
-    private static long originalHomeBusyMillis(int mode) {
-        if (mode == 2) return 3000L;
-        return 1400L;
-    }
-
-    private static void sleepRemaining(long startedMillis, long targetDurationMillis) {
-        long remaining = targetDurationMillis - (System.currentTimeMillis() - startedMillis);
-        if (remaining <= 0L) return;
-        try {
-            Thread.sleep(remaining);
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
     }
 
     private void publishTimedPoseRampToNeutral(int[] legs,
@@ -1342,7 +1380,7 @@ public final class ChicaController {
     }
 
     private void runOriginalCalibrate() {
-        if (activeWalk || walkWorkerRunning || setWorkerRunning || levelWorkerRunning) return;
+        if (originalMotionBusy()) return;
         if (standing) {
             enterOriginalSitPose();
             standing = false;
@@ -1350,58 +1388,41 @@ public final class ChicaController {
             servoBackend.setRelay(false);
         }
         servoBackend.refreshTelemetry();
-        if (!hasNumericLegTelemetry(servoBackend.legTouches())) {
-            Log.w("CHICA_CALIBRATE", "calibrate aborted: leg touch telemetry unavailable");
-            return;
-        }
 
         int[] previousActiveOutputLegs = activeOutputLegs;
         activeOutputLegs = ALL_LEGS;
         try {
+            // d.n0 constructs a fresh z0.n and copies j.f7128g, independent
+            // of the body/world position left by earlier movement.
+            gaitEngine.beginCalibration();
             for (int pass = 0; pass < 3; pass++) {
                 lastPulses = mergeActiveLegPulses(gaitEngine.calibrationRaiseAll(10.0d));
                 publishOriginalFrame();
                 sleepOriginalPoseStep(200.0d);
 
                 boolean[] contacted = new boolean[6];
-                for (int poll = 0; poll < ORIGINAL_CALIBRATION_MAX_POLLS; poll++) {
+                while (true) {
                     lastPulses = mergeActiveLegPulses(gaitEngine.calibrationCurrentPulses());
                     publishOriginalFrame();
                     sleepOriginalPoseStep(pass == 0 ? 5.0d : 100.0d);
                     servoBackend.refreshTelemetry();
                     double[] touches = servoBackend.legTouches();
-                    if (!hasNumericLegTelemetry(touches)) {
-                        Log.w("CHICA_CALIBRATE", "calibrate aborted: leg touch telemetry became unavailable");
-                        return;
-                    }
                     boolean allContacted = true;
                     for (int leg : ALL_LEGS) {
-                        if (touches[leg] > 0.5d) {
-                            contacted[leg] = true;
-                        }
+                        // The original replaces each contact result per poll;
+                        // an earlier touch does not latch contact indefinitely.
+                        contacted[leg] = !Double.isNaN(touches[leg]) && touches[leg] > 0.5d;
                         if (!contacted[leg]) {
                             allContacted = false;
                         }
                     }
                     if (allContacted) break;
                     gaitEngine.calibrationLowerUntouched(contacted, ORIGINAL_CALIBRATION_LOWER_STEP);
-                    if (poll == ORIGINAL_CALIBRATION_MAX_POLLS - 1) {
-                        Log.w("CHICA_CALIBRATE", "calibrate aborted: contact search exceeded guard limit");
-                        return;
-                    }
                 }
             }
         } finally {
             activeOutputLegs = previousActiveOutputLegs;
         }
-    }
-
-    private static boolean hasNumericLegTelemetry(double[] touches) {
-        if (touches == null || touches.length < 6) return false;
-        for (int leg : ALL_LEGS) {
-            if (Double.isNaN(touches[leg]) || Double.isInfinite(touches[leg])) return false;
-        }
-        return true;
     }
 
     private static String animationTraceJson(String method, double durationMs, double elapsedMs) {
@@ -1458,39 +1479,34 @@ public final class ChicaController {
 
     private static int[] parseQuadDisabledLegs(String command) {
         int colon = command.indexOf(':');
-        if (colon < 0 || colon + 1 >= command.length()) return new int[] {1, 4};
+        // d.n0 reads the first two integers and ignores extra fields. Preserve
+        // that mapping, including duplicate legs. Unlike the APK, reject bad
+        // input instead of terminating the service with an uncaught exception.
+        if (colon < 0 || colon + 1 >= command.length()) return null;
         String[] parts = command.substring(colon + 1).split(",");
-        if (parts.length < 2) return new int[] {1, 4};
+        if (parts.length < 2) return null;
         try {
-            return normalizeDisabledQuadLegs(new int[] {
-                    Integer.parseInt(parts[0].trim()),
-                    Integer.parseInt(parts[1].trim())
-            });
+            int first = Integer.parseInt(parts[0]);
+            int second = Integer.parseInt(parts[1]);
+            if (first < 0 || first >= 6 || second < 0 || second >= 6) return null;
+            return new int[] {first, second};
         } catch (NumberFormatException error) {
-            return new int[] {1, 4};
+            return null;
         }
-    }
-
-    private static int[] normalizeDisabledQuadLegs(int[] disabledLegs) {
-        int first = validLeg(disabledLegs != null && disabledLegs.length > 0 ? disabledLegs[0] : 1, 1);
-        int second = validLeg(disabledLegs != null && disabledLegs.length > 1 ? disabledLegs[1] : 4, 4);
-        if (first == second) second = first == 4 ? 1 : 4;
-        return new int[] {first, second};
     }
 
     private static int[] activeLegComplement(int[] disabledLegs) {
-        int[] disabled = normalizeDisabledQuadLegs(disabledLegs);
-        int[] active = new int[4];
+        boolean[] disabled = new boolean[6];
+        for (int leg : disabledLegs) disabled[leg] = true;
+        int count = 0;
+        for (boolean value : disabled) if (!value) count++;
+        int[] active = new int[count];
         int index = 0;
         for (int leg : ORIGINAL_ACTIVE_ORDER) {
-            if (leg == disabled[0] || leg == disabled[1]) continue;
+            if (disabled[leg]) continue;
             active[index++] = leg;
         }
         return active;
-    }
-
-    private static int validLeg(int value, int fallback) {
-        return value >= 0 && value < 6 ? value : fallback;
     }
 
     private static double[] parsePair(String command) {
@@ -1499,7 +1515,9 @@ public final class ChicaController {
         String[] parts = command.substring(colon + 1).split(",");
         if (parts.length < 2) return null;
         try {
-            return new double[] {Double.parseDouble(parts[0]), Double.parseDouble(parts[1])};
+            double first = Double.parseDouble(parts[0]);
+            double second = Double.parseDouble(parts[1]);
+            return new double[] {first, second};
         } catch (NumberFormatException error) {
             return null;
         }
@@ -1511,11 +1529,10 @@ public final class ChicaController {
         String[] parts = command.substring(colon + 1).split(",");
         if (parts.length < 3) return null;
         try {
-            return new double[] {
-                    Double.parseDouble(parts[0]),
-                    Double.parseDouble(parts[1]),
-                    Integer.parseInt(parts[2])
-            };
+            double first = Double.parseDouble(parts[0]);
+            double second = Double.parseDouble(parts[1]);
+            int style = Integer.parseInt(parts[2]);
+            return new double[] {first, second, style};
         } catch (NumberFormatException error) {
             return null;
         }
@@ -1527,11 +1544,10 @@ public final class ChicaController {
         String[] parts = command.substring(colon + 1).split(",");
         if (parts.length < 3) return null;
         try {
-            return new double[] {
-                    Double.parseDouble(parts[0]),
-                    Double.parseDouble(parts[1]),
-                    Double.parseDouble(parts[2])
-            };
+            double first = Double.parseDouble(parts[0]);
+            double second = Double.parseDouble(parts[1]);
+            double third = Double.parseDouble(parts[2]);
+            return new double[] {first, second, third};
         } catch (NumberFormatException error) {
             return null;
         }
@@ -1543,7 +1559,9 @@ public final class ChicaController {
         boolean transitioningToStop = pendingWalkClear;
         boolean walking = activeWalk || transitioningToStop;
         boolean stopping = pendingStopStep;
-        if (!relayStatus || !standing || (!walking && !stopping)) return false;
+        // z0.e drains its local target/anchors independently of the stand and
+        // relay flags. A sit accepted after walkclear must not kill that thread.
+        if (!walking && !stopping) return false;
         dtMs = originalFrameDt(walkStepCount, dtMs);
         lastStepMillis = now;
         boolean allowGait = walking || walkMagnitude(filteredWalk) > ORIGINAL_STOP_VECTOR_THRESHOLD;
@@ -1595,7 +1613,7 @@ public final class ChicaController {
             }
             // z0.e skips p3.a.p() only for a kept quadruped pose (gait id 20).
             if (!preserveKeptQuadrupedPose) {
-                publishOriginalWalkLayerFade();
+                publishOriginalLayerFade();
             }
             synchronized (ChicaController.this) {
                 walkWorkerRunning = false;
@@ -1605,23 +1623,27 @@ public final class ChicaController {
         thread.start();
     }
 
-    private void publishOriginalWalkLayerFade() {
-        double magnitude = gaitEngine.beginWalkLayerFade();
+    private void publishOriginalLayerFade() {
+        double[] fadeContext;
+        synchronized (this) {
+            fadeContext = gaitEngine.beginLayerFadeContext();
+        }
+        double magnitude = localSetTargetMagnitude(fadeContext);
         long previous = System.currentTimeMillis();
-        while (Double.isFinite(magnitude) && magnitude > 0.05000000074505806d) {
+        while (magnitude > 0.05000000074505806d) {
             long now = System.currentTimeMillis();
-            double amount = currentMode().speed * 0.1d * (double) (now - previous);
+            double amount = currentMode().speed * 0.1d * Math.max(0.0d, now - previous);
             if (amount >= magnitude) break;
             synchronized (this) {
-                lastPulses = mergeActiveLegPulses(gaitEngine.stepWalkLayerFade(amount));
+                lastPulses = mergeActiveLegPulses(gaitEngine.stepLayerFadeContext(fadeContext, amount));
                 publishOriginalFrame();
             }
             sleepOriginalPoseStep(ORIGINAL_POSE_STEP_MS);
-            magnitude -= amount;
+            magnitude = localSetTargetMagnitude(fadeContext);
             previous = now;
         }
         synchronized (this) {
-            lastPulses = mergeActiveLegPulses(gaitEngine.finishWalkLayerFade());
+            lastPulses = mergeActiveLegPulses(gaitEngine.finishLayerFadeContext(fadeContext));
             publishOriginalFrame();
         }
     }
@@ -1635,6 +1657,11 @@ public final class ChicaController {
         servoBackend.stageServoPulses(lastPulses);
         if (MOTION_TRACE_ENABLED) Log.i("CHICA_SERVO", Arrays.toString(lastPulses));
         frameCount++;
+        if (MOTION_TRACE_ENABLED) {
+            Log.i("CHICA_FRAME", "{\"frame\":" + frameCount
+                    + ",\"trace\":" + gaitEngine.lastCompactTraceJson()
+                    + ",\"pulses\":" + Arrays.toString(lastPulses) + "}");
+        }
         updatePanelBps();
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Firmware-derived Servo2040 serial protocol emulator.
 
-This models the byte stream in chica-servo2040-simpleDriver/chica-servo2040:
+This models the byte stream in firmware/servo2040-driver/chica-servo2040:
 SET (0xd3) writes servo/relay values, GET (0xc7) echoes the three-byte header
 and returns two 7-bit bytes per requested pin.
 """

@@ -705,7 +705,10 @@ WalkStepResult walkStep(const RobotConfig& config,
                     double eased = std::sin(gap * M_PI / 2.0);
                     double denom = (1.0 - eased) * (0.12 * cycle) * 1000.0;
                     double rate = denom > 1e-9
-                        ? std::sin(std::min(dt_ms_scaled / denom, 1.0) * M_PI / 2.0) : 1.0;
+                        // Match the original r5.g(): it applies sin(x*pi/2)
+                        // directly, without clamping x to 1. The unbounded tail
+                        // is observable in the captured CoG-layer trace.
+                        ? std::sin((dt_ms_scaled / denom) * M_PI / 2.0) : 1.0;
                     state.cog_layer.xyz.x += rate * (target.x - state.cog_layer.xyz.x);
                     state.cog_layer.xyz.y += rate * (target.y - state.cog_layer.xyz.y);
                 }

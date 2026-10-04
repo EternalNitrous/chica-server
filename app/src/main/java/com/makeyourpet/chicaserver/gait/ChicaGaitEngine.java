@@ -211,6 +211,31 @@ public final class ChicaGaitEngine implements AutoCloseable {
         return nativeClearSetPose(nativeHandle);
     }
 
+    public synchronized int[] stepSetWorker(double[] workerState, double[] target, int sweepMode, double dtMs) {
+        ensureOpen();
+        return nativeStepSetWorker(nativeHandle, workerState, target, sweepMode, dtMs);
+    }
+
+    public synchronized double[] beginLayerFadeContext() {
+        ensureOpen();
+        return nativeBeginLayerFadeContext(nativeHandle);
+    }
+
+    public synchronized int[] stepLayerFadeContext(double[] context, double amount) {
+        ensureOpen();
+        return nativeLayerFadeContext(nativeHandle, context, amount, false);
+    }
+
+    public synchronized int[] finishLayerFadeContext(double[] context) {
+        ensureOpen();
+        return nativeLayerFadeContext(nativeHandle, context, 0.0d, true);
+    }
+
+    public synchronized void keepSetPose() {
+        ensureOpen();
+        nativeKeepSetPose(nativeHandle);
+    }
+
     /**
      * Push the per-servo calibration, mechanical attach angles, and servo pin
      * map parsed from chica.config into the native angle->pulse conversion.
@@ -249,6 +274,11 @@ public final class ChicaGaitEngine implements AutoCloseable {
     public synchronized double levelPoseMagnitude() {
         ensureOpen();
         return nativeLevelPoseMagnitude(nativeHandle);
+    }
+
+    public synchronized void beginCalibration() {
+        ensureOpen();
+        nativeBeginCalibration(nativeHandle);
     }
 
     public synchronized int[] calibrationCurrentPulses() {
@@ -392,6 +422,11 @@ public final class ChicaGaitEngine implements AutoCloseable {
                                                    boolean z5,
                                                    double dtMs);
     private static native int[] nativeClearSetPose(long handle);
+    private static native int[] nativeStepSetWorker(long handle, double[] workerState, double[] target,
+                                                   int sweepMode, double dtMs);
+    private static native double[] nativeBeginLayerFadeContext(long handle);
+    private static native int[] nativeLayerFadeContext(long handle, double[] context, double amount, boolean finish);
+    private static native void nativeKeepSetPose(long handle);
     private static native void nativeSetServoConfig(int[] cal36, double[] coxa6,
                                                     double femurAttach, double tibiaAttach,
                                                     int[] pin18);
@@ -405,6 +440,7 @@ public final class ChicaGaitEngine implements AutoCloseable {
     private static native int[] nativeDecayLevelPose(long handle,
                                                      double factor);
     private static native double nativeLevelPoseMagnitude(long handle);
+    private static native void nativeBeginCalibration(long handle);
     private static native int[] nativeCalibrationCurrentPulses(long handle);
     private static native int[] nativeCalibrationRaiseAll(long handle,
                                                           double deltaZ);

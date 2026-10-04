@@ -20,8 +20,6 @@ takes commands over the network from any client.
    │ (app or  │     port 18711     │  (Android phone)  │     115200 8N1    │  Pololu board  │
    │  script) │ ◄───────────────── │                   │ ◄──────────────── │  → 18 servos   │
    └──────────┘    status lines    └───────────────────┘     telemetry     └────────────────┘
-                                       reads phone IMU
-                                      (heading / tilt)
 ```
 
 so there are really two conversations going on, and each gets its own section below:
@@ -156,13 +154,9 @@ which way it's facing without any extra hardware.
 
 ## Building
 
-easiest path is **Android Studio** — open the project, let it sync, hit Run. it
-brings its own JDK and offers to grab any missing SDK/NDK bits, so there's nothing
-else to do.
+easiest way to build is through **Android Studio**. Open the project, let it sync, then hit run.
 
-from the command line you just need a **JDK (anything from 17 to 25 works)** and the
-**Android SDK**. the wrapper pins the rest — Gradle 9.1 and the Android Gradle Plugin
-— so it builds the same everywhere.
+from the command line, you'll need JDK 17-25 and the Andorid SDK.
 
 ```bash
 # point Gradle at your SDK (skip if $ANDROID_HOME is already set)

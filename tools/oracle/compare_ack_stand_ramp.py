@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_ORIGINAL = ROOT.parent / "oracle" / "controltrace_ack_stand_ramp_virtualtouch_original.jsonl"
-DEFAULT_REBUILT = ROOT.parent / "oracle" / "controltrace_ack_stand_ramp_virtualtouch_rebuilt.jsonl"
+WORKSPACE = ROOT.parents[1]
+ORACLE_DIR = Path(os.environ.get("CHICA_ORACLE_DIR", WORKSPACE / "research-private" / "oracle"))
+DEFAULT_ORIGINAL = ORACLE_DIR / "controltrace_ack_stand_ramp_virtualtouch_original.jsonl"
+DEFAULT_REBUILT = ORACLE_DIR / "controltrace_ack_stand_ramp_virtualtouch_rebuilt.jsonl"
 EXPECTED_STANDING_VALUES = [float(value) for value in range(49, 19, -1)]
 
 
